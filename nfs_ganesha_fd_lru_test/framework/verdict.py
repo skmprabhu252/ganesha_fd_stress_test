@@ -237,15 +237,19 @@ class VerdictEngine:
                 settled_reclaim = max(0, last.fsal_opened_fd - last.state_fd)
                 signal = "FSAL FDs minus state FDs"
         else:
-            # V3: every open FD is an LRU entry — use lru_entries_in_use
-            peak_reclaim    = burst.peak_lru_entries
-            settled_reclaim = cooldown.settled_lru_entries
-            signal = "LRU entries (V3)"
+            # V3: the LRU reclaims *file descriptors*, not inode-cache entries.
+            # lru_entries_in_use counts inode-cache slots — those stay populated
+            # after FD reclamation (the inode is kept for reuse) and therefore
+            # do NOT drop during cooldown.  fsal_opened_fd (Total FD) is the
+            # correct signal: it rises under load and falls as the LRU reclaims.
+            peak_reclaim    = burst.peak_fsal_fd
+            settled_reclaim = cooldown.settled_fsal_fd
+            signal = "FSAL FDs (V3)"
             if peak_reclaim == 0:
-                # lru_entries not available — fall back to fsal_opened_fd
-                peak_reclaim    = burst.peak_fsal_fd
-                settled_reclaim = cooldown.settled_fsal_fd
-                signal = "FSAL FDs (V3 fallback)"
+                # No FD data at all — fall back to lru_entries as a last resort
+                peak_reclaim    = burst.peak_lru_entries
+                settled_reclaim = cooldown.settled_lru_entries
+                signal = "LRU entries (V3 fallback)"
 
         if peak_reclaim == 0:
             return _inconclusive(name, "No FD data available — cannot evaluate LRU reclamation")

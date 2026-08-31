@@ -149,37 +149,16 @@ class ReportBuilder:
 
     def _write_log_events(self, phases: List[MonitorPhase]) -> None:
         self._section("5. GANESHA LOG EVENTS (CORRELATED)")
-        all_events = [e for p in phases for e in p.events]
+        # phase.events are already deduplicated by the monitor — see monitor.py
+        all_events = sorted(
+            [e for p in phases for e in p.events],
+            key=lambda e: e.timestamp,
+        )
         if not all_events:
             self._ln("  (no structured log events captured)")
             return
 
-        # Deduplicate GANESHA_RESTART events: multiple log lines are emitted per
-        # restart (one per thread / init step).  Group them by (truncated_minute,
-        # epoch_token) so each actual restart appears only once.
-        from .log_parser import LogEventKind
-        import re as _re
-
-        _EPOCH_RE = _re.compile(r"epoch\s+([0-9a-fA-F]+)", _re.I)
-        _NODE_RE  = _re.compile(r":\s+(\S+)\s+:\s+gpfs\.ganesha\.nfsd", _re.I)
-
-        seen_restarts: set = set()
-        deduplicated: list = []
-        for ev in sorted(all_events, key=lambda e: e.timestamp):
-            if ev.kind == LogEventKind.GANESHA_RESTART:
-                epoch_m = _EPOCH_RE.search(ev.raw_line)
-                node_m  = _NODE_RE.search(ev.raw_line)
-                epoch   = epoch_m.group(1) if epoch_m else ""
-                node    = node_m.group(1)  if node_m  else ""
-                # Collapse to one-minute resolution to handle slight timestamp drift
-                minute_bucket = int(ev.timestamp) // 60
-                key = (minute_bucket, epoch, node)
-                if key in seen_restarts:
-                    continue
-                seen_restarts.add(key)
-            deduplicated.append(ev)
-
-        for ev in deduplicated:
+        for ev in all_events:
             ts = time.strftime("%H:%M:%S", time.localtime(ev.timestamp))
             self._ln(
                 f"  [{ts}] {ev.kind.name:<22} "

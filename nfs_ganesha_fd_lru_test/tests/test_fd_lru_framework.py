@@ -579,8 +579,46 @@ class TestLogParser(unittest.TestCase):
         self.assertIsNotNone(ev); self.assertEqual(ev.kind, LogEventKind.STATE_FD_PRESSURE)
 
     def test_ganesha_restart(self):
-        ev = parse_log_line("2024/05/01 15:35:00 : ganesha.nfsd: starting")
+        # Canonical GPFS/RHEL9 restart line (ISO timestamp, structured fields)
+        line = (
+            "2026-08-31 19:22:42 : epoch 00023aae : scale2-22 : "
+            "gpfs.ganesha.nfsd-1091341[main] nfs_start :NFS STARTUP :EVENT :"
+            "             NFS SERVER INITIALIZED"
+        )
+        ev = parse_log_line(line)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.kind, LogEventKind.GANESHA_RESTART)
+
+    def test_ganesha_restart_iso_timestamp_parsed(self):
+        """ISO dash-separated timestamp must be extracted correctly."""
+        import datetime
+        line = (
+            "2026-08-31 19:22:42 : epoch 00023aae : scale2-22 : "
+            "gpfs.ganesha.nfsd-1091341[main] nfs_start :NFS STARTUP :EVENT :"
+            "             NFS SERVER INITIALIZED"
+        )
+        ev = parse_log_line(line)
+        self.assertIsNotNone(ev)
+        dt = datetime.datetime.fromtimestamp(ev.timestamp)
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 8)
+        self.assertEqual(dt.day, 31)
+        self.assertEqual(dt.hour, 19)
+        self.assertEqual(dt.minute, 22)
+
+    def test_ganesha_restart_slash_timestamp_still_works(self):
+        ev = parse_log_line("2024/05/01 15:35:00 : Initializing memory and logging")
         self.assertIsNotNone(ev); self.assertEqual(ev.kind, LogEventKind.GANESHA_RESTART)
+
+    def test_ganesha_restart_running_daemon_line_not_matched(self):
+        """A normal per-RPC log line that contains the process name must NOT match."""
+        line = (
+            "2026-08-31 20:46:39 : epoch 00023aae : scale2-22 : "
+            "gpfs.ganesha.nfsd-1091341[svc_0] some_rpc_func :NFS4 :EVENT : some normal op"
+        )
+        ev = parse_log_line(line)
+        # Should not be classified as a restart
+        self.assertIsNone(ev)
 
     def test_fd_count_diag(self):
         ev = parse_log_line("2024/05/01 15:30:00 : FD count: total=100000 global=80000 state=15000 temp=5000")
@@ -597,7 +635,7 @@ class TestLogParser(unittest.TestCase):
             "2024/05/01 15:33:00 : FD hard limit exceeded total=524288 global=504000 state=18000 temp=2288\n"
             "2024/05/01 15:33:05 : LRU futility count exceeded\n"
             "2024/05/01 15:33:10 : State FDs exceed hiwat\n"
-            "2024/05/01 15:35:00 : ganesha.nfsd: starting\n"
+            "2026-08-31 19:22:42 : epoch 00023aae : scale2-22 : gpfs.ganesha.nfsd-1091341[main] nfs_start :NFS STARTUP :EVENT :             NFS SERVER INITIALIZED\n"
         )
         kinds = {e.kind for e in parse_log_text(log)}
         for k in (LogEventKind.HIGH_WATERMARK, LogEventKind.HARD_LIMIT,

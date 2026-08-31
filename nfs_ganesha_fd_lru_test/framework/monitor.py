@@ -16,6 +16,7 @@ Consumers read the samples and events after the phase ends.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,32 @@ from .log_parser import LogEvent, LogEventKind, parse_log_text
 from .ssh_client import SSHClient
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Restart event deduplication key
+# ---------------------------------------------------------------------------
+
+_EPOCH_RE = re.compile(r"epoch\s+([0-9a-fA-F]+)", re.I)
+_NODE_RE  = re.compile(r":\s+(\S+)\s+:", re.I)
+
+
+def _restart_dedup_key(ev: LogEvent) -> tuple:
+    """
+    Return a hashable key that identifies a unique Ganesha restart instance.
+
+    A single restart emits multiple matching log lines (one per thread /
+    init step).  Collapsing by (minute_bucket, epoch, node) reduces them
+    to a single representative event so the verdict engine sees an accurate
+    restart count.
+    """
+    epoch_m = _EPOCH_RE.search(ev.raw_line)
+    node_m  = _NODE_RE.search(ev.raw_line)
+    epoch   = epoch_m.group(1) if epoch_m else ""
+    node    = node_m.group(1)  if node_m  else ""
+    # Bucket to the nearest minute to tolerate slight timestamp spread
+    # across the lines emitted during a single startup sequence.
+    minute_bucket = int(ev.timestamp) // 60
+    return (minute_bucket, epoch, node)
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +156,15 @@ class MonitorPhase:
                 peak    = max(0, self.peak_fsal_fd - peak_state)
                 settled = max(0, self.settled_fsal_fd - self.samples[-1].state_fd)
         else:
-            # V3: lru_entries_in_use is the correct signal
-            peak    = self.peak_lru_entries
-            settled = self.settled_lru_entries
+            # V3: fsal_opened_fd (Total FD) is the correct reclamation signal.
+            # lru_entries_in_use counts inode-cache slots which do NOT drop
+            # when the LRU reclaims FDs (the inode stays cached for reuse).
+            peak    = self.peak_fsal_fd
+            settled = self.settled_fsal_fd
             if peak == 0:
-                peak    = self.peak_fsal_fd
-                settled = self.settled_fsal_fd
+                # No FD data — last resort fallback to inode cache count
+                peak    = self.peak_lru_entries
+                settled = self.settled_lru_entries
 
         if peak == 0:
             return True   # no data — inconclusive but not a failure
@@ -240,12 +270,31 @@ class ServerMonitor:
             events = self._poll_log()
             if events:
                 with self._lock:
-                    # Deduplicate by raw_line to avoid re-adding old entries
-                    existing = {e.raw_line for e in phase.events}
+                    # De-duplicate events so the verdict engine sees clean counts.
+                    #
+                    # Non-restart events: deduplicate by raw_line (a tail window
+                    # will return the same lines on every poll).
+                    #
+                    # GANESHA_RESTART events: additionally collapse by
+                    # (minute_bucket, epoch_token, node_name) — a single restart
+                    # emits one matching line per thread / init step, so without
+                    # this a fresh boot produces O(100) identical events.
+                    existing_lines = {e.raw_line for e in phase.events}
+                    seen_restart_keys = {
+                        _restart_dedup_key(e)
+                        for e in phase.events
+                        if e.kind == LogEventKind.GANESHA_RESTART
+                    }
                     for ev in events:
-                        if ev.raw_line not in existing:
-                            phase.events.append(ev)
-                            existing.add(ev.raw_line)
+                        if ev.raw_line in existing_lines:
+                            continue
+                        if ev.kind == LogEventKind.GANESHA_RESTART:
+                            key = _restart_dedup_key(ev)
+                            if key in seen_restart_keys:
+                                continue
+                            seen_restart_keys.add(key)
+                        phase.events.append(ev)
+                        existing_lines.add(ev.raw_line)
 
             self._stop_event.wait(timeout=self.poll_interval_sec)
 

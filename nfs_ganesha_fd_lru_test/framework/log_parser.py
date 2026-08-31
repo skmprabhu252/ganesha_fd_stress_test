@@ -10,6 +10,25 @@ Recognises the message categories introduced by Patch 1247084:
 
 Events are timestamped and stored as LogEvent objects that can be
 correlated with FDSample snapshots.
+
+Restart detection
+-----------------
+A GANESHA_RESTART event is raised only when the log contains a line that
+unambiguously signals a fresh daemon start, i.e. the startup banner that
+Ganesha always prints when it first initialises.  Normal per-thread log
+lines that happen to contain the daemon binary name (gpfs.ganesha.nfsd)
+are NOT considered restarts — every log line from a running daemon
+includes the process name, so matching on the name alone produces massive
+false-positive counts.
+
+The specific patterns matched are:
+  • "NFS-Ganesha Release" / "Starting NFS-Ganesha"  — Ganesha's own banner
+  • "Initializing memory and logging"                — very first init step
+  • "ganesha_init_complete" / "Init complete"        — end of init sequence
+  • "Loading parameters from"                        — config load at startup
+
+Lines that contain the process name in a routine per-RPC or per-thread
+context (e.g. "gpfs.ganesha.nfsd-NNNN[svc_0]") do NOT match.
 """
 
 from __future__ import annotations
@@ -62,8 +81,11 @@ class LogEvent:
 # Patterns
 # ---------------------------------------------------------------------------
 
-# Ganesha log timestamp formats: "2024/05/01 15:32:41" or "15:32:41.123"
-_TS_FULL  = re.compile(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
+# Ganesha log timestamp formats:
+#   "2024/05/01 15:32:41"  — slash-separated (older builds)
+#   "2026-08-31 19:22:42"  — ISO dash-separated (GPFS/RHEL9 builds, as seen in production)
+#   "15:32:41"             — time-only (short form, date inferred from today)
+_TS_FULL  = re.compile(r"(\d{4}[/-]\d{2}[/-]\d{2} \d{2}:\d{2}:\d{2})")
 _TS_SHORT = re.compile(r"(\d{2}:\d{2}:\d{2})")
 
 # FD count diagnostic — emitted periodically by the FD manager
@@ -92,9 +114,42 @@ _STATE_FD_PATTERN = re.compile(
     r"(state\s+fd.*?hiwat|state\s+fd\s+pressure|state\s+fds?\s+exceed)", re.I
 )
 
-# Ganesha restart/crash signal
+# Ganesha restart/crash signal.
+#
+# The canonical restart marker in the GPFS/RHEL9 structured log format is:
+#
+#   ... gpfs.ganesha.nfsd-NNNN[main] nfs_start :NFS STARTUP :EVENT : NFS SERVER INITIALIZED
+#
+# This line is emitted by the nfs_start() function exactly once per daemon
+# init, when the NFS server has completed all initialisation steps.
+# It is the most reliable restart indicator because:
+#   • function name "nfs_start" only runs at startup
+#   • component "NFS STARTUP" is only active during init
+#   • message "NFS SERVER INITIALIZED" is the final init-complete log entry
+#
+# Additional patterns cover other Ganesha build variants / log styles:
+#   • "NFS-Ganesha Release …"        — upstream release banner
+#   • "Starting/Started NFS-Ganesha" — systemd service messages
+#   • "Initializing memory and logging" — very first init step (some builds)
+#   • "Loading parameters from …"    — config load at startup
+#   • "ganesha_init_complete"        — explicit completion marker (some builds)
+#
+# Deliberately excluded: any line that merely contains the process name
+# "gpfs.ganesha.nfsd" in a per-thread / per-RPC context — those appear in
+# every log line from a running daemon and would produce false positives.
 _RESTART_PATTERN = re.compile(
-    r"(ganesha\.nfsd.*?(start|init|restart|restarting|loading\s+config))", re.I
+    r"("
+    r"NFS\s+SERVER\s+INITIALIZED"
+    r"|NFS\s+STARTUP"
+    r"|\bnfs_start\b"
+    r"|NFS-Ganesha\s+Release"
+    r"|Starting\s+NFS-Ganesha"
+    r"|Started\s+NFS-Ganesha"
+    r"|Initializing\s+memory\s+and\s+logging"
+    r"|Loading\s+parameters\s+from"
+    r"|ganesha_init_complete"
+    r")",
+    re.I,
 )
 
 # Number extraction helper
@@ -117,8 +172,11 @@ def _extract_timestamp(line: str, now: float) -> float:
     import datetime
     m = _TS_FULL.search(line)
     if m:
+        raw = m.group(1)
+        # Normalise separator so both "2026-08-31" and "2026/08/31" parse correctly
+        normalised = raw.replace("/", "-")
         try:
-            dt = datetime.datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+            dt = datetime.datetime.strptime(normalised, "%Y-%m-%d %H:%M:%S")
             return dt.timestamp()
         except ValueError:
             pass
