@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name            = "nfs-ganesha-fd-lru-test"
+version         = "1.0.0"
+description     = "NFS-Ganesha FD/LRU Stress and Reclamation Test Framework"
+requires-python = ">=3.8"
+license         = {text = "Apache-2.0"}
+
+[project.scripts]
+nfs-ganesha-fd-lru-test = "nfs_ganesha_fd_lru_test.main:main"
+
+[tool.pytest.ini_options]
+testpaths      = ["nfs_ganesha_fd_lru_test/tests"]
+python_files   = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+log_cli        = true
+log_cli_level  = "WARNING"
