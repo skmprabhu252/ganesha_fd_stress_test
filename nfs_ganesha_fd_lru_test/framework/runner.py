@@ -113,11 +113,52 @@ class CycleRunner:
             logger.warning("umount %s:%s failed (ignored): %s",
                            client.address, mnt, result.stderr)
 
+    def _cleanup_workload_dirs(self, client, sub: str) -> None:
+        """
+        Remove workload-owned subdirectories under the NFS mount point.
+
+        Must be called after the mount is established but before the burst
+        starts.  Without this, files left from a previous cycle remain on the
+        server and keep Ganesha FDs open, which inflates the baseline FD count
+        and prevents accurate measurement of per-cycle FD pressure.
+
+        Only the directories created by the workload worker are removed:
+          client_<id>_thread_NNN_<sub>/  — per-thread file trees
+          _held_open_<id>/               — held-open handle files
+
+        The operation is best-effort: a failure is logged but does not abort
+        the cycle — a dirty mount is better than no test at all.
+        """
+        mnt = os.path.join(client.mount_point, sub)
+        client_id = client.address.replace(".", "_").replace(":", "_")
+        ssh = self._client_ssh(client)
+        # Use shell globbing to remove all thread dirs and the held-open dir
+        # for this client in one SSH round-trip.  The `|| true` ensures the
+        # command succeeds even when the directories do not exist yet (cycle 1).
+        cmd = (
+            f"rm -rf {mnt}/client_{client_id}_thread_*_{sub} "
+            f"{mnt}/_held_open_{client_id} || true"
+        )
+        result = ssh.run_remote(client.address, cmd, timeout=60)
+        if not result.ok:
+            logger.warning(
+                "Workload dir cleanup failed on %s:%s (ignored): %s",
+                client.address, mnt, result.stderr,
+            )
+        else:
+            logger.debug("Cleaned up workload dirs on %s:%s", client.address, mnt)
+
     def _mount_all(self, protocol: str) -> None:
         """Mount all required NFS versions on every client."""
         for client in self.config.clients:
             for ver, sub in self._nfs_versions(protocol):
                 self._mount_nfs(client, ver, sub)
+
+    def _cleanup_all(self, protocol: str) -> None:
+        """Remove workload files from all clients before a burst cycle."""
+        for client in self.config.clients:
+            for _ver, sub in self._nfs_versions(protocol):
+                self._cleanup_workload_dirs(client, sub)
 
     def _umount_all(self, protocol: str) -> None:
         """Unmount all NFS mounts on every client (best-effort)."""
@@ -181,8 +222,11 @@ class CycleRunner:
         wl = self.config.workload
         logger.info("=== Cycle %d / Protocol %s ===", cycle_number, protocol)
 
-        # Mount NFS on all clients before the burst
+        # Mount NFS on all clients before the burst, then clean up any files
+        # left by the previous cycle so Ganesha starts each burst with a
+        # clean FD slate.
         self._mount_all(protocol)
+        self._cleanup_all(protocol)
 
         try:
             # --- BURST PHASE ---
