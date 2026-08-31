@@ -221,6 +221,17 @@ class ServerMonitor:
         self._stats_unavailable_since: Optional[float] = None
         self.stats_unavailable = False
 
+        # Record the moment this monitor was created.  Any log event whose
+        # parsed timestamp predates this point is from a previous test run or
+        # a historical startup and must be silently discarded — the monitor
+        # uses `tail -n N` with no seek cursor, so every poll re-reads the
+        # same historical tail of the log file.
+        # A 60-second tolerance is subtracted to cover:
+        #   • clock skew between the orchestrator and the Ganesha server
+        #   • the baseline collection window (~15 s) that happens before
+        #     cycle 1 starts (events from that window ARE relevant)
+        self._test_start_time: float = time.time() - 60.0
+
     # ------------------------------------------------------------------
     # Internal polling
     # ------------------------------------------------------------------
@@ -270,6 +281,14 @@ class ServerMonitor:
             events = self._poll_log()
             if events:
                 with self._lock:
+                    # Drop events that predate this test run.
+                    # The log is read with `tail -n N` (no cursor), so every
+                    # poll re-reads historical entries from previous runs.
+                    # Any event whose timestamp is before _test_start_time is
+                    # stale and must not influence verdicts.
+                    events = [e for e in events
+                               if e.timestamp >= self._test_start_time]
+
                     # De-duplicate events so the verdict engine sees clean counts.
                     #
                     # Non-restart events: deduplicate by raw_line (a tail window
@@ -277,8 +296,7 @@ class ServerMonitor:
                     #
                     # GANESHA_RESTART events: additionally collapse by
                     # (minute_bucket, epoch_token, node_name) — a single restart
-                    # emits one matching line per thread / init step, so without
-                    # this a fresh boot produces O(100) identical events.
+                    # emits one matching line per thread / init step.
                     existing_lines = {e.raw_line for e in phase.events}
                     seen_restart_keys = {
                         _restart_dedup_key(e)

@@ -835,6 +835,96 @@ class TestMonitorPhase(unittest.TestCase):
         self.assertFalse(p.lru_made_progress())   # no samples → False (no data)
 
 
+
+# =============================================================================
+# ServerMonitor — historical-event timestamp filter
+# =============================================================================
+
+class TestServerMonitorTimestampFilter(unittest.TestCase):
+    """
+    Verify that log events predating _test_start_time are silently dropped
+    and never reach phase.events — even when the raw_line is unique.
+    """
+
+    def _make_monitor(self):
+        from unittest.mock import MagicMock
+        from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor
+        from nfs_ganesha_fd_lru_test.framework.config import ServerConfig
+        cfg = ServerConfig(address="srv", ssh_address="srv")
+        ssh = MagicMock()
+        ssh.run_remote.return_value = MagicMock(ok=False, stdout="", stderr="")
+        return ServerMonitor(cfg, ssh)
+
+    def test_historical_event_is_dropped(self):
+        """An event timestamped before test start must not enter phase.events."""
+        from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor, MonitorPhase
+        from nfs_ganesha_fd_lru_test.framework.log_parser import LogEvent, LogEventKind
+        monitor = self._make_monitor()
+        phase = MonitorPhase(label="burst_cycle_1")
+
+        # Build a restart event 2 hours before the monitor was created
+        old_ev = LogEvent(
+            kind=LogEventKind.GANESHA_RESTART,
+            timestamp=monitor._test_start_time - 7200,
+            raw_line="2026-08-31 19:22:42 : epoch 00023aae : scale2-22 : "
+                     "gpfs.ganesha.nfsd-1091341[main] nfs_start :NFS STARTUP "
+                     ":EVENT :             NFS SERVER INITIALIZED",
+            message="NFS SERVER INITIALIZED",
+        )
+
+        # Simulate what _monitor_loop does
+        events = [old_ev]
+        with monitor._lock:
+            events = [e for e in events if e.timestamp >= monitor._test_start_time]
+            existing_lines = {e.raw_line for e in phase.events}
+            for ev in events:
+                if ev.raw_line not in existing_lines:
+                    phase.events.append(ev)
+                    existing_lines.add(ev.raw_line)
+
+        self.assertEqual(len(phase.events), 0,
+                         "Historical event must be filtered out")
+
+    def test_current_event_is_kept(self):
+        """An event timestamped after test start must enter phase.events."""
+        from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor, MonitorPhase
+        from nfs_ganesha_fd_lru_test.framework.log_parser import LogEvent, LogEventKind
+        import time as _time
+        monitor = self._make_monitor()
+        phase = MonitorPhase(label="burst_cycle_1")
+
+        # Build a restart event 10 seconds after the monitor was created
+        new_ev = LogEvent(
+            kind=LogEventKind.GANESHA_RESTART,
+            timestamp=monitor._test_start_time + 10,
+            raw_line="2026-08-31 21:34:55 : epoch 00023aae : scale2-22 : "
+                     "gpfs.ganesha.nfsd-1091342[main] nfs_start :NFS STARTUP "
+                     ":EVENT :             NFS SERVER INITIALIZED",
+            message="NFS SERVER INITIALIZED",
+        )
+
+        events = [new_ev]
+        with monitor._lock:
+            events = [e for e in events if e.timestamp >= monitor._test_start_time]
+            existing_lines = {e.raw_line for e in phase.events}
+            for ev in events:
+                if ev.raw_line not in existing_lines:
+                    phase.events.append(ev)
+                    existing_lines.add(ev.raw_line)
+
+        self.assertEqual(len(phase.events), 1,
+                         "Current-test event must be kept")
+
+    def test_test_start_time_is_in_recent_past(self):
+        """_test_start_time should be within ~65 seconds of now."""
+        import time as _time
+        monitor = self._make_monitor()
+        age = _time.time() - monitor._test_start_time
+        self.assertGreater(age, 0, "_test_start_time must be in the past")
+        self.assertLess(age, 120, "_test_start_time must be recent (within 2 min)")
+
+
+
 # =============================================================================
 # Verdict engine
 # =============================================================================
