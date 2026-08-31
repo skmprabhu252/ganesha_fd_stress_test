@@ -139,7 +139,7 @@ class CycleRunner:
             f"rm -rf {mnt}/client_{client_id}_thread_*_{sub} "
             f"{mnt}/_held_open_{client_id} || true"
         )
-        result = ssh.run_remote(client.address, cmd, timeout=60)
+        result = ssh.run_remote(client.address, cmd, timeout=180)
         if not result.ok:
             logger.warning(
                 "Workload dir cleanup failed on %s:%s (ignored): %s",
