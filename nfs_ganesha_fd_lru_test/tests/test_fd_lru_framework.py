@@ -834,6 +834,37 @@ class TestMonitorPhase(unittest.TestCase):
         self.assertTrue(p.fd_settled())
         self.assertFalse(p.lru_made_progress())   # no samples → False (no data)
 
+    def test_hiwat_true_via_stats_label_above_hwm(self):
+        """high_watermark_reached is True when a sample carries 'Above High Water Mark'."""
+        ph = MonitorPhase(label="burst")
+        s = FDSample(fsal_opened_fd=18000, system_fd_limit=20000,
+                     fd_usage_label="Above High Water Mark")
+        ph.samples.append(s)
+        self.assertTrue(ph.high_watermark_reached)
+
+    def test_hiwat_true_via_stats_label_hard_limit(self):
+        """high_watermark_reached is also True when label is 'Hard Limit reached'."""
+        ph = MonitorPhase(label="burst")
+        s = FDSample(fsal_opened_fd=20000, system_fd_limit=20000,
+                     fd_usage_label="Hard Limit reached")
+        ph.samples.append(s)
+        self.assertTrue(ph.high_watermark_reached)
+
+    def test_hard_limit_reached_via_stats_label(self):
+        """hard_limit_reached is True when a sample carries 'Hard Limit reached'."""
+        ph = MonitorPhase(label="burst")
+        s = FDSample(fsal_opened_fd=20000, system_fd_limit=20000,
+                     fd_usage_label="Hard Limit reached")
+        ph.samples.append(s)
+        self.assertTrue(ph.hard_limit_reached)
+
+    def test_hard_limit_not_reached_for_above_hwm_only(self):
+        """hard_limit_reached is False when label is only 'Above High Water Mark'."""
+        ph = MonitorPhase(label="burst")
+        s = FDSample(fsal_opened_fd=18000, system_fd_limit=20000,
+                     fd_usage_label="Above High Water Mark")
+        ph.samples.append(s)
+        self.assertFalse(ph.hard_limit_reached)
 
 
 # =============================================================================

@@ -110,11 +110,30 @@ class MonitorPhase:
 
     @property
     def high_watermark_reached(self) -> bool:
-        return any(e.kind == LogEventKind.HIGH_WATERMARK for e in self.events)
+        # Primary: log-file events emitted by Ganesha when the LRU thread wakes.
+        if any(e.kind == LogEventKind.HIGH_WATERMARK for e in self.events):
+            return True
+        # Fallback: ganesha_stats reports "FD usage : Above High Water Mark"
+        # (or "Hard Limit reached") as a text label in its inode output.
+        # The log may not contain the matching log-level message (e.g. it was
+        # rotated, below the tail window, or the build emits a different string),
+        # but the stats label is always present while the condition holds.
+        _hwm_labels = {"above high water mark", "hard limit reached"}
+        return any(
+            s.fd_usage_label.lower() in _hwm_labels
+            for s in self.samples
+        )
 
     @property
     def hard_limit_reached(self) -> bool:
-        return any(e.kind == LogEventKind.HARD_LIMIT for e in self.events)
+        # Primary: log-file HARD_LIMIT events.
+        if any(e.kind == LogEventKind.HARD_LIMIT for e in self.events):
+            return True
+        # Fallback: ganesha_stats "FD usage : Hard Limit reached" label.
+        return any(
+            "hard limit" in s.fd_usage_label.lower()
+            for s in self.samples
+        )
 
     @property
     def futility_detected(self) -> bool:
