@@ -149,9 +149,18 @@ class ReportBuilder:
 
     def _write_log_events(self, phases: List[MonitorPhase]) -> None:
         self._section("5. GANESHA LOG EVENTS (CORRELATED)")
-        # phase.events are already deduplicated by the monitor — see monitor.py
+        # phase.events are deduplicated within each phase, but consecutive phases
+        # can pull overlapping tails. Deduplicate by raw_line across all phases.
+        seen = set()
+        unique_events = []
+        for p in phases:
+            for e in p.events:
+                if e.raw_line not in seen:
+                    seen.add(e.raw_line)
+                    unique_events.append(e)
+
         all_events = sorted(
-            [e for p in phases for e in p.events],
+            unique_events,
             key=lambda e: e.timestamp,
         )
         if not all_events:

@@ -1277,6 +1277,21 @@ class TestReportBuilder(unittest.TestCase):
         self.assertIn("overall",     d)
         self.assertIn("cycle_verdicts", d)
 
+    def test_event_deduplication_across_phases(self):
+        cfg = _cfg()
+        env = EnvironmentInfo(server_address="ts", protocol="V3")
+        b   = ReportBuilder(config=cfg, env=env, baseline=BaselineStats())
+        ev = LogEvent(kind=LogEventKind.HARD_LIMIT, timestamp=time.time(), raw_line="DUPLICATE EVENT LINE", message="DUPLICATE EVENT LINE")
+        
+        # Add the identical event to two distinct phases
+        phases = [
+            _phase(label="burst_1", events=[ev]),
+            _phase(label="cooldown_1", events=[ev])
+        ]
+        report_text = b.build(SuiteVerdict(protocol="V3"), phases, [])
+        # Count occurrences of the raw event line in the report
+        self.assertEqual(report_text.count("DUPLICATE EVENT LINE"), 1)
+
 
 # =============================================================================
 # §6  Preflight (mock-based)

@@ -183,10 +183,13 @@ class VerdictEngine:
         )
 
     def check_ganesha_no_restart(self, phases: List[MonitorPhase]) -> DimensionResult:
-        restarts = [
-            e for p in phases for e in p.events
-            if e.kind == LogEventKind.GANESHA_RESTART
-        ]
+        seen = set()
+        restarts = []
+        for p in phases:
+            for e in p.events:
+                if e.kind == LogEventKind.GANESHA_RESTART and e.raw_line not in seen:
+                    seen.add(e.raw_line)
+                    restarts.append(e)
         ok = len(restarts) == 0
         evidence = [e.raw_line for e in restarts[:5]]
         return _v(
