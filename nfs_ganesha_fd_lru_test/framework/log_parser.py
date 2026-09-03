@@ -169,7 +169,8 @@ _SINGLE_NUM   = re.compile(r"\b(\d+)\b")
 _HIWAT_NUM    = re.compile(r"hiwat[=:\s]+(\d+)", re.I)
 _LOWAT_NUM    = re.compile(r"lowat[=:\s]+(\d+)", re.I)
 _FUTILITY_CNT = re.compile(r"futility[=:\s]+(\d+)", re.I)
-_STATE_EXCEED_RE = re.compile(r"State\s+FDs\s*\((\d+)\)\s*exceed\s*hiwat\s*\((\d+)\)", re.I)
+_STATE_FD_VAL_RE = re.compile(r"State\s+FDs?\s*\(?\s*(\d+)\s*\)?", re.I)
+_HIWAT_VAL_RE    = re.compile(r"hiwat\s*\(?\s*(\d+)\s*\)?", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ def _extract_fd_breakdown(line: str) -> Tuple[int, int, int, int]:
     m = _FD_NUMS.search(line)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-    m = _STATE_EXCEED_RE.search(line)
+    m = _STATE_FD_VAL_RE.search(line)
     if m:
         val = int(m.group(1))
         return val, 0, val, 0
@@ -243,9 +244,9 @@ def parse_log_line(line: str, now: Optional[float] = None) -> Optional[LogEvent]
 
     if _STATE_FD_PATTERN.search(line):
         hiwat = 0
-        m = _STATE_EXCEED_RE.search(line)
+        m = _HIWAT_VAL_RE.search(line)
         if m:
-            hiwat = int(m.group(2))
+            hiwat = int(m.group(1))
         return LogEvent(
             kind=LogEventKind.STATE_FD_PRESSURE,
             timestamp=ts,
