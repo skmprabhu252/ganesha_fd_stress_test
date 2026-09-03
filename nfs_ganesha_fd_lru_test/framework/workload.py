@@ -201,6 +201,7 @@ def _run_thread(
     file_size: int,
     retry_timeout: float,
     retry_interval: float,
+    protocol: str = "v3",
 ) -> None:
     """
     Body of a single workload thread.
@@ -226,21 +227,29 @@ def _run_thread(
             cat = classify_oserror(exc)
             _bump_error_counter(stats, cat)
 
+    open_fhs = {}
+    is_v4 = protocol.lower() == "v4"
+
     while not stop_event.is_set():
         fname = random.choice(file_names)
         stats.opens_attempted += 1
         fh = None
         try:
-            def _open():
-                return open(fname, "r+b")
+            if is_v4 and fname in open_fhs:
+                fh = open_fhs[fname]
+            else:
+                def _open():
+                    return open(fname, "r+b")
 
-            fh = with_retry(
-                _open,
-                timeout_sec=retry_timeout,
-                interval_sec=retry_interval,
-                stats=stats,
-            )
-            stats.opens_succeeded += 1
+                fh = with_retry(
+                    _open,
+                    timeout_sec=retry_timeout,
+                    interval_sec=retry_interval,
+                    stats=stats,
+                )
+                stats.opens_succeeded += 1
+                if is_v4:
+                    open_fhs[fname] = fh
 
             # read
             fh.seek(0)
@@ -257,13 +266,27 @@ def _run_thread(
             cat = classify_oserror(exc)
             _bump_error_counter(stats, cat)
             logger.debug("thread %d open error %s: %s", thread_id, cat, exc)
+            if is_v4 and fname in open_fhs:
+                try:
+                    open_fhs[fname].close()
+                except OSError:
+                    pass
+                del open_fhs[fname]
         finally:
-            if fh is not None:
+            if not is_v4 and fh is not None:
                 try:
                     fh.close()
                     stats.closes += 1
                 except OSError:
                     pass
+
+    if is_v4:
+        for fh in open_fhs.values():
+            try:
+                fh.close()
+                stats.closes += 1
+            except OSError:
+                pass
 
 
 def _bump_error_counter(stats: WorkloadStats, category: str) -> None:
@@ -303,7 +326,7 @@ def _classify(exc):
     if c in (errno.ESTALE, 116): return "ESTALE"
     return "OTHER"
 
-def _run_thread(tid, mount_point, subdir, stop_event, stats, num_files, file_size, retry_timeout, retry_interval):
+def _run_thread(tid, mount_point, subdir, stop_event, stats, num_files, file_size, retry_timeout, retry_interval, protocol="v3"):
     base = pathlib.Path(mount_point) / subdir
     try:
         base.mkdir(parents=True, exist_ok=True)
@@ -336,38 +359,53 @@ def _run_thread(tid, mount_point, subdir, stop_event, stats, num_files, file_siz
                   if os.path.exists(f)]  # noqa: PTH110
     if not file_names:
         return
+    open_fhs = {}
+    is_v4 = protocol.lower() == "v4"
     while not stop_event.is_set():
         fname = random.choice(file_names)
         stats["opens_attempted"] += 1
         fh = None
         try:
-            deadline = time.monotonic() + retry_timeout
-            attempts = 0
-            last_exc = None
-            while time.monotonic() < deadline:
-                try:
-                    fh = open(fname, "r+b"); break
-                except OSError as exc:
-                    cat = _classify(exc)
-                    if cat not in ("EIO", "ENFILE"):
-                        raise
-                    last_exc = exc; attempts += 1
-                    stats["opens_retried"] += 1
-                    time.sleep(retry_interval)
+            if is_v4 and fname in open_fhs:
+                fh = open_fhs[fname]
             else:
-                raise last_exc
-            if attempts > 0:
-                stats["opens_eventually_ok"] += 1
-            stats["opens_succeeded"] += 1
+                deadline = time.monotonic() + retry_timeout
+                attempts = 0
+                last_exc = None
+                while time.monotonic() < deadline:
+                    try:
+                        fh = open(fname, "r+b"); break
+                    except OSError as exc:
+                        cat = _classify(exc)
+                        if cat not in ("EIO", "ENFILE"):
+                            raise
+                        last_exc = exc; attempts += 1
+                        stats["opens_retried"] += 1
+                        time.sleep(retry_interval)
+                else:
+                    raise last_exc
+                if attempts > 0:
+                    stats["opens_eventually_ok"] += 1
+                stats["opens_succeeded"] += 1
+                if is_v4:
+                    open_fhs[fname] = fh
             fh.seek(0); _ = fh.read(min(file_size, 4096)); stats["reads"] += 1
             fh.seek(0); fh.write(payload[:min(file_size, 64)]); stats["writes"] += 1
         except OSError as exc:
             stats["opens_failed"] += 1
             _bump(stats, _classify(exc))
+            if is_v4 and fname in open_fhs:
+                try: open_fhs[fname].close()
+                except OSError: pass
+                del open_fhs[fname]
         finally:
-            if fh is not None:
+            if not is_v4 and fh is not None:
                 try: fh.close(); stats["closes"] += 1
                 except OSError: pass
+    if is_v4:
+        for fh in open_fhs.values():
+            try: fh.close(); stats["closes"] += 1
+            except OSError: pass
 
 def _bump(stats, cat):
     if cat == "EMFILE":   stats["emfile_count"] += 1
@@ -425,7 +463,8 @@ def main():
             kwargs=dict(tid=tid, mount_point=mount_point, subdir=subdir,
                         stop_event=stop_event, stats=thread_stats[tid],
                         num_files=num_files, file_size=file_size,
-                        retry_timeout=retry_timeout, retry_interval=retry_interval),
+                        retry_timeout=retry_timeout, retry_interval=retry_interval,
+                        protocol=protocol),
             daemon=True,
         )
         t.start(); threads.append(t)
@@ -610,6 +649,7 @@ class WorkloadWorker:
                     file_size=self.file_size_bytes,
                     retry_timeout=self.retry_timeout_sec,
                     retry_interval=self.retry_interval_sec,
+                    protocol=self.protocol,
                 ),
                 daemon=True,
                 name=f"workload-{tid}",
