@@ -199,54 +199,76 @@ class VerdictEngine:
     def check_lru_reclamation(
         self, burst: MonitorPhase, cooldown: MonitorPhase, protocol: str = "V3"
     ) -> DimensionResult:
+        """
+        Evaluate whether the Ganesha reaper thread reclaimed FDs correctly.
+
+        Ganesha reaper / LRU design
+        ----------------------------
+        Watermark thresholds (default Ganesha configuration):
+          Hard limit  = 100 % of system_fd_limit  → triggers aggressive reap
+          High Water Mark (HWM) = 90 % of system_fd_limit  → reaper target
+          Low  Water Mark (LWM) = ~10 % of system_fd_limit → reaper STOPS here
+
+        Reaper behaviour when hard limit is hit (NFSv3):
+          1. Reaper thread wakes and aggressively closes LRU entries.
+          2. Reaper reaps until FD count drops BELOW HWM (90 %).
+          3. Reaper STOPS at HWM — it does NOT drive FDs to LWM during the
+             burst.  FDs will only reach LWM level very slowly over a long
+             idle period after all client opens have ceased.
+
+        Therefore the ONLY correct pass criterion for a burst+cooldown test is:
+
+            settled FD count  <  HWM  (i.e.  < 0.90 × system_fd_limit)
+
+        A result between HWM and LWM is NORMAL and correct.
+        A result above HWM after cooldown means the reaper failed to reclaim.
+        A result at or below LWM during a short cooldown would be surprising
+        and is NOT required.
+
+        When system_fd_limit is unknown (no stats samples), we fall back to
+        a relative-drop heuristic.
+
+        NFSv4 note
+        ----------
+        State FDs are closed by the client CLOSE operation, not the LRU.
+        Only global (reclaimable) FDs are subject to reaper reclamation; the
+        same HWM target applies to the global_fd count.
+        """
         name = "lru_reclamation"
 
         if not burst.samples or not cooldown.samples:
             return _inconclusive(name, "Insufficient FD samples to evaluate LRU reclamation")
 
-        # NFSv3 and NFSv4 have fundamentally different FD lifecycle semantics:
-        #
-        # NFSv3 (stateless / connectionless):
-        #   - Every open FD is placed in the LRU — the LRU is the only way
-        #     Ganesha can reclaim FDs because clients never guarantee CLOSE.
-        #   - Signal: lru_entries_in_use drops when the LRU reclaims entries.
-        #   - state_fd is irrelevant (always 0 for V3).
-        #
-        # NFSv4 (stateful / connection-oriented):
-        #   - State FDs (open-state records) are NEVER placed in the LRU.
-        #     They are closed by the client via the CLOSE operation.
-        #     The LRU has no authority to reclaim them.
-        #   - Only global (reclaimable) FDs go through the LRU.
-        #   - Signal for LRU reclamation: global_fd only.
-        #   - State FD cleanup is tracked separately in check_v4_state_fd_closure.
-
         is_v4 = protocol in (ProtocolMode.V4, ProtocolMode.BOTH)
 
+        # Derive system_fd_limit from the most recent sample that has it.
+        all_samples = burst.samples + cooldown.samples
+        fd_limit = next(
+            (s.system_fd_limit for s in reversed(all_samples) if s.system_fd_limit > 0),
+            0,
+        )
+        # HWM is Ganesha's default 90 % of the system FD limit.
+        hwm = int(fd_limit * 0.90) if fd_limit > 0 else 0
+
         if is_v4:
-            # V4: use global_fd (reclaimable portion only — state_fd excluded)
-            peak_reclaim    = burst.peak_global_fd
-            settled_reclaim = cooldown.settled_global_fd
-            signal = "global FDs (V4 reclaimable)"
-            if peak_reclaim == 0:
-                # global_fd breakdown not available in this build — fall back
-                # to fsal_opened_fd minus state_fd at peak
-                peak_fsal    = burst.peak_fsal_fd
+            # V4: reclaimable = global_fd only; state_fd is closed by clients
+            if burst.peak_global_fd > 0:
+                peak_reclaim    = burst.peak_global_fd
+                settled_reclaim = cooldown.settled_global_fd
+                signal = "global FDs (V4 reclaimable)"
+            else:
+                # global_fd breakdown not available — approximate
                 peak_state   = max((s.state_fd for s in burst.samples), default=0)
-                peak_reclaim = max(0, peak_fsal - peak_state)
+                peak_reclaim = max(0, burst.peak_fsal_fd - peak_state)
                 last         = cooldown.samples[-1]
                 settled_reclaim = max(0, last.fsal_opened_fd - last.state_fd)
                 signal = "FSAL FDs minus state FDs"
         else:
-            # V3: the LRU reclaims *file descriptors*, not inode-cache entries.
-            # lru_entries_in_use counts inode-cache slots — those stay populated
-            # after FD reclamation (the inode is kept for reuse) and therefore
-            # do NOT drop during cooldown.  fsal_opened_fd (Total FD) is the
-            # correct signal: it rises under load and falls as the LRU reclaims.
+            # V3: all open FDs are LRU-reclaimable
             peak_reclaim    = burst.peak_fsal_fd
             settled_reclaim = cooldown.settled_fsal_fd
             signal = "FSAL FDs (V3)"
             if peak_reclaim == 0:
-                # No FD data at all — fall back to lru_entries as a last resort
                 peak_reclaim    = burst.peak_lru_entries
                 settled_reclaim = cooldown.settled_lru_entries
                 signal = "LRU entries (V3 fallback)"
@@ -254,8 +276,34 @@ class VerdictEngine:
         if peak_reclaim == 0:
             return _inconclusive(name, "No FD data available — cannot evaluate LRU reclamation")
 
-        reclaimed_pct = (peak_reclaim - settled_reclaim) / peak_reclaim * 100.0
+        # ── Primary check: reaper brought FDs below the HWM ──────────────────
+        if hwm > 0:
+            below_hwm = settled_reclaim < hwm
+            hwm_pct   = hwm / fd_limit * 100.0
+            if below_hwm:
+                return DimensionResult(
+                    name=name,
+                    verdict=Verdict.PASS,
+                    reason=(
+                        f"Reaper reclaimed FDs to below HWM: "
+                        f"{settled_reclaim:,} < HWM {hwm:,} ({hwm_pct:.0f}% of {fd_limit:,}) ✓  "
+                        f"[{signal}: burst peak {peak_reclaim:,}]"
+                    ),
+                )
+            # FDs are still above HWM after cooldown — reaper did not finish
+            overshoot = settled_reclaim - hwm
+            return DimensionResult(
+                name=name,
+                verdict=Verdict.FAIL,
+                reason=(
+                    f"Reaper did NOT bring FDs below HWM after cooldown: "
+                    f"settled={settled_reclaim:,} ≥ HWM={hwm:,} ({hwm_pct:.0f}% of {fd_limit:,})  "
+                    f"overshoot={overshoot:,}  [{signal}: burst peak {peak_reclaim:,}]"
+                ),
+            )
 
+        # ── Fallback (no fd_limit available): relative-drop heuristic ─────────
+        reclaimed_pct = (peak_reclaim - settled_reclaim) / peak_reclaim * 100.0
         if reclaimed_pct >= 50.0:
             return DimensionResult(
                 name=name,
@@ -268,7 +316,8 @@ class VerdictEngine:
                 name=name,
                 verdict=Verdict.WARNING,
                 reason=f"Partial LRU reclamation {reclaimed_pct:.1f}% of {signal} — "
-                       f"may require investigation ({peak_reclaim:,} → {settled_reclaim:,})",
+                       f"fd_limit unavailable, cannot check HWM "
+                       f"({peak_reclaim:,} → {settled_reclaim:,})",
             )
         return DimensionResult(
             name=name,
@@ -341,8 +390,11 @@ class VerdictEngine:
         settled = cooldown.fd_settled()
         return _v(
             settled, name,
-            "FD usage settled to stable level after cooldown",
-            "FD usage did not settle — may indicate FD leak or slow reclamation",
+            # FDs settling between HWM and LWM after a burst is the normal,
+            # correct outcome — the reaper stops at HWM, not at LWM.
+            "FD usage stable after cooldown (level between HWM and LWM is normal)",
+            "FD usage did not stabilise after cooldown — may indicate FD leak "
+            "or reaper unable to keep up with open rate",
         )
 
     def check_fd_retention_across_cycles(
@@ -443,6 +495,25 @@ class VerdictEngine:
     def check_high_watermark(
         self, burst: MonitorPhase, cooldown: MonitorPhase, protocol: str = "V3"
     ) -> DimensionResult:
+        """
+        Verify the Ganesha reaper correctly handles the high-water-mark condition.
+
+        Ganesha reaper design
+        ---------------------
+        HWM (90 % of fd_limit) is the reaper's target, not its floor.
+        When FDs cross HWM the reaper wakes; it reaps until FDs drop *below*
+        HWM, then stops.  The Low Water Mark (~10 %) is only reached during a
+        sustained idle period — it is NOT the expected end state after a short
+        cooldown window.
+
+        Verdicts
+        --------
+        WARNING      : HWM was reached AND settled FDs < HWM by end of cooldown
+                       (reaper did its job — HWM events are expected under load).
+        FAIL         : HWM was reached but settled FDs ≥ HWM after cooldown
+                       (reaper woke but did not finish reclaiming).
+        INCONCLUSIVE : HWM was not reached — workload pressure was insufficient.
+        """
         name = "high_watermark_handling"
         if not burst.high_watermark_reached:
             return _inconclusive(
@@ -450,21 +521,45 @@ class VerdictEngine:
                 "High watermark was not reached — FD pressure may have been insufficient. "
                 "FD pressure exercised: LIMITED",
             )
-        # HWM reached — did LRU make progress from burst peak to end of cooldown?
-        # burst_phase is passed so the peak is taken from the burst (where FDs are
-        # highest), not from the cooldown's own first sample (which may already be
-        # well below peak if reclamation began immediately after the burst ended).
+
+        # Derive HWM threshold from samples (system_fd_limit × 0.90).
+        all_samples = burst.samples + cooldown.samples
+        fd_limit = next(
+            (s.system_fd_limit for s in reversed(all_samples) if s.system_fd_limit > 0),
+            0,
+        )
+        hwm = int(fd_limit * 0.90) if fd_limit > 0 else 0
+
+        settled = cooldown.settled_fsal_fd
+        if protocol in (ProtocolMode.V4, ProtocolMode.BOTH) and cooldown.settled_global_fd > 0:
+            settled = cooldown.settled_global_fd
+
+        if hwm > 0:
+            # Reaper's job: bring FDs below HWM.
+            if settled < hwm:
+                return _warn(
+                    name,
+                    f"HWM reached (EXPECTED) → reaper woke → FDs reclaimed below HWM ✓  "
+                    f"settled={settled:,} < HWM={hwm:,} ({hwm/fd_limit*100:.0f}% of {fd_limit:,})",
+                )
+            return DimensionResult(
+                name=name,
+                verdict=Verdict.FAIL,
+                reason=(
+                    f"HWM reached but reaper did NOT bring FDs below HWM after cooldown: "
+                    f"settled={settled:,} ≥ HWM={hwm:,} ({hwm/fd_limit*100:.0f}% of {fd_limit:,})"
+                ),
+            )
+
+        # fd_limit unknown — fall back to lru_made_progress heuristic
         lru_ok = cooldown.lru_made_progress(protocol, burst_phase=burst)
         if lru_ok:
-            return _warn(
-                name,
-                "High watermark reached (EXPECTED) → LRU woke → FDs reclaimed ✓",
-            )
+            return _warn(name, "HWM reached (EXPECTED) → LRU woke → FDs reclaimed ✓")
         return DimensionResult(
             name=name,
             verdict=Verdict.FAIL,
-            reason="High watermark reached but LRU did not reclaim FDs meaningfully "
-                   "(settled FD count still ≥ 90% of burst peak after cooldown)",
+            reason="HWM reached but LRU did not reclaim FDs meaningfully after cooldown "
+                   "(fd_limit unavailable — used relative-drop heuristic)",
         )
 
     def check_hard_limit(self, burst: MonitorPhase, stats: WorkloadStats) -> DimensionResult:
