@@ -146,7 +146,7 @@ class CycleRunner:
                 client.address, mnt, result.stderr,
             )
         else:
-            logger.debug("Cleaned up workload dirs on %s:%s", client.address, mnt)
+            logger.info("  Cleanup done: %s:%s", client.address, mnt)
 
     def _mount_all(self, protocol: str) -> None:
         """Mount all required NFS versions on every client."""
@@ -156,9 +156,11 @@ class CycleRunner:
 
     def _cleanup_all(self, protocol: str) -> None:
         """Remove workload files from all clients before a burst cycle."""
+        logger.info("  Cleaning up workload dirs on %d client(s)...", len(self.config.clients))
         for client in self.config.clients:
             for _ver, sub in self._nfs_versions(protocol):
                 self._cleanup_workload_dirs(client, sub)
+        logger.info("  Cleanup complete.")
 
     def _umount_all(self, protocol: str) -> None:
         """Unmount all NFS mounts on every client (best-effort)."""
