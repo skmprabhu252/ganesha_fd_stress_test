@@ -79,6 +79,9 @@ def _parse_args(argv=None):
     p.add_argument("--mode", default=RunMode.NORMAL,
                    choices=[RunMode.FAST, RunMode.NORMAL, RunMode.SOAK],
                    help="Execution mode controlling workload size and cycle count.")
+    p.add_argument("--cycles", type=int, default=0,
+                   help="Override the number of test cycles (0 = use mode default: "
+                        "fast=1, normal=6, soak=12).")
 
     # SSH / server
     p.add_argument("--ssh-user",   default="root")
@@ -175,8 +178,9 @@ def main(argv=None) -> int:
               f"Valid: {list(SCENARIO_MAP)}", file=sys.stderr)
         return 2
 
+    cycles_info = f"  cycles={args.cycles}" if args.cycles > 0 else ""
     print(f"\n{'='*62}")
-    print(f"  NFS-Ganesha FD/LRU Test  |  mode={args.mode.upper()}")
+    print(f"  NFS-Ganesha FD/LRU Test  |  mode={args.mode.upper()}{cycles_info}")
     print(f"  Server : {args.server}{args.export}")
     print(f"  Clients: {', '.join(c.address for c in config.clients)}")
     print(f"  Running: {', '.join(ids_to_run)}")
@@ -190,6 +194,8 @@ def main(argv=None) -> int:
         print(f"{'─'*62}")
         sc_config = copy.deepcopy(config)
         scenario  = get_scenario(sc_id, sc_config, mode=args.mode)
+        if args.cycles > 0:
+            sc_config.num_cycles = args.cycles
         try:
             suite = scenario.run()
             status = suite.overall.value
