@@ -586,6 +586,15 @@ class TestLogParser(unittest.TestCase):
         ev = parse_log_line("2024/05/01 15:33:10 : State FDs exceed hiwat state=200000")
         self.assertIsNotNone(ev); self.assertEqual(ev.kind, LogEventKind.STATE_FD_PRESSURE)
 
+    def test_new_state_fd_pressure_pattern(self):
+        line = "2026-09-03 16:35:54 : epoch 00014313 : scale2-21 : gpfs.ganesha.nfsd-3524654[fd_lru] fd_lru_run :FSAL :WARN :State FDs (19016) exceed hiwat(12000). Skipping aggressive reaping to avoid futile CPU work."
+        ev = parse_log_line(line)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.kind, LogEventKind.STATE_FD_PRESSURE)
+        self.assertEqual(ev.state_fd, 19016)
+        self.assertEqual(ev.total_fd, 19016)
+        self.assertEqual(ev.hiwat, 12000)
+
     def test_ganesha_restart(self):
         # Canonical GPFS/RHEL9 restart line (ISO timestamp, structured fields)
         line = (
