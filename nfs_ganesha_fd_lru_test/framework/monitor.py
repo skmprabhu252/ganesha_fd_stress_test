@@ -40,8 +40,13 @@ def _fmt_epoch(epoch: float) -> str:
 # Restart event deduplication key
 # ---------------------------------------------------------------------------
 
-_EPOCH_RE = re.compile(r"epoch\s+([0-9a-fA-F]+)", re.I)
-_NODE_RE  = re.compile(r":\s+(\S+)\s+:", re.I)
+_EPOCH_RE  = re.compile(r"epoch\s+([0-9a-fA-F]+)", re.I)
+_NODE_RE   = re.compile(r":\s+(\S+)\s+:", re.I)
+# Thread names in the GPFS/Ganesha log: [svc_35], [fd_lru], [reaper], [main], etc.
+# Strip them so that identical messages emitted simultaneously by different worker
+# threads (e.g. every svc_N hitting the hard-limit at the same second) are treated
+# as one event, not N separate events.
+_THREAD_RE = re.compile(r"\[\w[\w_]*\d*\]")
 
 
 def _restart_dedup_key(ev: LogEvent) -> tuple:
@@ -154,12 +159,30 @@ class MonitorPhase:
     def ganesha_restarted(self) -> bool:
         return any(e.kind == LogEventKind.GANESHA_RESTART for e in self.events)
 
-    def lru_made_progress(self, protocol: str = "V3") -> bool:
+    def lru_made_progress(
+        self,
+        protocol: str = "V3",
+        burst_phase: "Optional[MonitorPhase]" = None,
+    ) -> bool:
         """
         True if the LRU shows meaningful downward movement after cooldown.
 
+        Parameters
+        ----------
+        protocol:
+            "V3", "V4", or "BOTH".
+        burst_phase:
+            The preceding burst phase.  When provided, ``peak`` is taken from
+            the burst (the true high-water FD count) rather than from this
+            cooldown phase's own first sample.  This is the correct comparison:
+            the LRU's job is to bring FDs back down from the burst peak, so
+            progress must be measured across the full burst→cooldown span.
+            Without this, a slow-but-steady reclamation that doesn't drop 10%
+            *within* the cooldown window alone is incorrectly reported as no
+            progress.
+
         NFSv3 (stateless):
-          Every open FD is an LRU entry.  Signal: lru_entries_in_use.
+          Every open FD is an LRU entry.  Signal: fsal_opened_fd.
 
         NFSv4 (stateful):
           State FDs are NEVER in the LRU — they are closed by clients via
@@ -174,22 +197,36 @@ class MonitorPhase:
         is_v4 = protocol in ("V4", "BOTH")
 
         if is_v4:
-            peak    = self.peak_global_fd
+            # Peak comes from burst if available; settled from end of cooldown.
+            if burst_phase is not None and burst_phase.peak_global_fd > 0:
+                peak = burst_phase.peak_global_fd
+            else:
+                peak = self.peak_global_fd
             settled = self.settled_global_fd
             if peak == 0:
                 # No breakdown — approximate reclaimable as fsal minus state
-                peak_state = max((s.state_fd for s in self.samples), default=0)
-                peak    = max(0, self.peak_fsal_fd - peak_state)
+                if burst_phase is not None:
+                    peak_state = max((s.state_fd for s in burst_phase.samples), default=0)
+                    peak = max(0, burst_phase.peak_fsal_fd - peak_state)
+                else:
+                    peak_state = max((s.state_fd for s in self.samples), default=0)
+                    peak = max(0, self.peak_fsal_fd - peak_state)
                 settled = max(0, self.settled_fsal_fd - self.samples[-1].state_fd)
         else:
             # V3: fsal_opened_fd (Total FD) is the correct reclamation signal.
             # lru_entries_in_use counts inode-cache slots which do NOT drop
             # when the LRU reclaims FDs (the inode stays cached for reuse).
-            peak    = self.peak_fsal_fd
+            if burst_phase is not None and burst_phase.peak_fsal_fd > 0:
+                peak = burst_phase.peak_fsal_fd
+            else:
+                peak = self.peak_fsal_fd
             settled = self.settled_fsal_fd
             if peak == 0:
                 # No FD data — last resort fallback to inode cache count
-                peak    = self.peak_lru_entries
+                if burst_phase is not None:
+                    peak = burst_phase.peak_lru_entries
+                else:
+                    peak = self.peak_lru_entries
                 settled = self.settled_lru_entries
 
         if peak == 0:
@@ -383,13 +420,25 @@ class ServerMonitor:
 
                     # De-duplicate events so the verdict engine sees clean counts.
                     #
-                    # Non-restart events: deduplicate by raw_line (a tail window
-                    # will return the same lines on every poll).
+                    # Two sources of duplicates must be handled:
                     #
-                    # GANESHA_RESTART events: additionally collapse by
-                    # (minute_bucket, epoch_token, node_name) — a single restart
-                    # emits one matching line per thread / init step.
+                    # 1. Poll-window repeats: tail -n N re-reads the same lines
+                    #    on every poll iteration.  Deduplicated by raw_line.
+                    #
+                    # 2. Per-thread fan-out: when Ganesha hits a condition like
+                    #    the hard-limit, every service thread (svc_0 … svc_N)
+                    #    independently logs the same message at the same second.
+                    #    These lines differ only in the thread name "[svc_N]".
+                    #    Deduplicated by (kind, second-bucket, thread-stripped line).
+                    #
+                    # 3. GANESHA_RESTART events: further collapsed by
+                    #    (minute_bucket, epoch_token, node_name) — a single restart
+                    #    emits one matching line per thread / init step.
                     existing_lines = {e.raw_line for e in phase.events}
+                    seen_content_keys: set = {
+                        (e.kind, int(e.timestamp), _THREAD_RE.sub("", e.raw_line))
+                        for e in phase.events
+                    }
                     seen_restart_keys = {
                         _restart_dedup_key(e)
                         for e in phase.events
@@ -398,6 +447,13 @@ class ServerMonitor:
                     for ev in events:
                         if ev.raw_line in existing_lines:
                             continue
+                        content_key = (
+                            ev.kind,
+                            int(ev.timestamp),
+                            _THREAD_RE.sub("", ev.raw_line),
+                        )
+                        if content_key in seen_content_keys:
+                            continue
                         if ev.kind == LogEventKind.GANESHA_RESTART:
                             key = _restart_dedup_key(ev)
                             if key in seen_restart_keys:
@@ -405,6 +461,7 @@ class ServerMonitor:
                             seen_restart_keys.add(key)
                         phase.events.append(ev)
                         existing_lines.add(ev.raw_line)
+                        seen_content_keys.add(content_key)
 
             self._stop_event.wait(timeout=self.poll_interval_sec)
 

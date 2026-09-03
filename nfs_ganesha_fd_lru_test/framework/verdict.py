@@ -450,17 +450,21 @@ class VerdictEngine:
                 "High watermark was not reached — FD pressure may have been insufficient. "
                 "FD pressure exercised: LIMITED",
             )
-        # HWM reached — did LRU make progress on the reclaimable portion?
-        lru_ok = cooldown.lru_made_progress(protocol)
+        # HWM reached — did LRU make progress from burst peak to end of cooldown?
+        # burst_phase is passed so the peak is taken from the burst (where FDs are
+        # highest), not from the cooldown's own first sample (which may already be
+        # well below peak if reclamation began immediately after the burst ended).
+        lru_ok = cooldown.lru_made_progress(protocol, burst_phase=burst)
         if lru_ok:
             return _warn(
                 name,
-                "High watermark reached (EXPECTED) → LRU woke → global FD reclaimed ✓",
+                "High watermark reached (EXPECTED) → LRU woke → FDs reclaimed ✓",
             )
         return DimensionResult(
             name=name,
             verdict=Verdict.FAIL,
-            reason="High watermark reached but LRU did not make meaningful progress",
+            reason="High watermark reached but LRU did not reclaim FDs meaningfully "
+                   "(settled FD count still ≥ 90% of burst peak after cooldown)",
         )
 
     def check_hard_limit(self, burst: MonitorPhase, stats: WorkloadStats) -> DimensionResult:
@@ -491,7 +495,7 @@ class VerdictEngine:
             return _inconclusive(name, "No futility events detected in this cycle")
 
         # Futility + reclaimable FD remains high after cooldown + no settle = FAIL
-        lru_no_progress = not cooldown.lru_made_progress(protocol)
+        lru_no_progress = not cooldown.lru_made_progress(protocol, burst_phase=burst)
         no_settle = not cooldown.fd_settled()
 
         if lru_no_progress and no_settle:
