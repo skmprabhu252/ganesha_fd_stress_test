@@ -529,9 +529,15 @@ class BaseScenario:
             env.fd_system_limit = sample.system_fd_limit
 
         # Ganesha version (best effort)
+        # Support both gpfs.ganesha.nfsd (GPFS environments) and standard ganesha.nfsd
+        version_cmd = (
+            "command -v gpfs.ganesha.nfsd >/dev/null "
+            "&& (gpfs.ganesha.nfsd -v 2>&1 || gpfs.ganesha.nfsd --version 2>&1) | head -1 "
+            "|| (ganesha.nfsd -v 2>&1 || ganesha.nfsd --version 2>&1) | head -1"
+        )
         r3 = self.ssh.run_remote(
             ssh_host,
-            "ganesha.nfsd --version 2>&1 | head -1",
+            version_cmd,
             timeout=10,
         )
         if r3.ok:
