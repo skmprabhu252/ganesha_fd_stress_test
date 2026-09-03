@@ -401,6 +401,14 @@ class TestScenarioConfigSetup(unittest.TestCase):
         self.assertGreater(s.config.workload.threads_per_client, 4)
         self.assertGreater(s.config.workload.num_files, 100)
 
+    def test_cycles_override_is_respected(self):
+        for tc_id in ["TC02", "TC03", "TC04"]:
+            cfg = _cfg()
+            cfg.num_cycles_override = 2
+            s = get_scenario(tc_id, cfg, mode=RunMode.NORMAL)
+            s.setup_extra_config()
+            self.assertEqual(s.config.num_cycles, 2)
+
 
 # =============================================================================
 # §9  FD statistics parser

@@ -149,6 +149,7 @@ def _build_config(args) -> TestConfig:
             num_files=args.files,
             file_size_bytes=args.file_size,
         ),
+        num_cycles_override=getattr(args, "cycles", 0) if getattr(args, "cycles", 0) > 0 else None,
         fd_tolerance_pct=args.fd_tolerance,
     )
 

@@ -58,7 +58,7 @@ class TC03_NFSv4_Stress(BaseScenario):
     def setup_extra_config(self) -> None:
         profile = ModeProfile.for_mode(self._mode)
         wl = self.config.workload
-        self.config.num_cycles   = profile.num_cycles
+        self.config.num_cycles   = self.config.num_cycles_override or profile.num_cycles
         wl.threads_per_client    = max(1, int(wl.threads_per_client * profile.threads_multiplier))
         wl.num_files             = max(1, int(wl.num_files           * profile.files_multiplier))
         wl.burst_duration_sec    = profile.burst_duration_sec

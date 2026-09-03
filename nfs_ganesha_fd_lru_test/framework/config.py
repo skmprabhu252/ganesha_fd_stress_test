@@ -149,6 +149,7 @@ class TestConfig:
     workload: WorkloadConfig
     protocol: str = ProtocolMode.BOTH
     num_cycles: int = 6
+    num_cycles_override: Optional[int] = None
     fd_tolerance_pct: float = 10.0       # % increase allowed across settled cycles
     fd_accounting_tolerance: int = 100   # allowed discrepancy total ≈ global+state+temp
     scenario: str = ""                   # e.g. "TC01", "TC04" — empty = all
