@@ -42,11 +42,19 @@ def _fmt_epoch(epoch: float) -> str:
 
 _EPOCH_RE  = re.compile(r"epoch\s+([0-9a-fA-F]+)", re.I)
 _NODE_RE   = re.compile(r":\s+(\S+)\s+:", re.I)
-# Thread names in the GPFS/Ganesha log: [svc_35], [fd_lru], [reaper], [main], etc.
-# Strip them so that identical messages emitted simultaneously by different worker
-# threads (e.g. every svc_N hitting the hard-limit at the same second) are treated
-# as one event, not N separate events.
-_THREAD_RE = re.compile(r"\[\w[\w_]*\d*\]")
+# Thread names in the GPFS/Ganesha log have a fixed prefix and a variable
+# numeric suffix:
+#   [svc_35]   [svc_1197]  → prefix "svc_",   suffix is a variable worker id
+#   [fd_lru]               → fixed name, no variable suffix
+#   [reaper]               → fixed name
+#   [main]                 → fixed name
+#   [dbus]                 → fixed name
+#
+# To collapse same-second messages from different svc_N threads into one event,
+# we normalise the thread name by stripping the trailing digits — turning
+# [svc_1197] and [svc_35] both into [svc_] so the dedup content key matches.
+# Fixed-name threads like [fd_lru] have no trailing digits and are unchanged.
+_THREAD_RE = re.compile(r"\[(\w+?)\d*\]")
 
 
 def _restart_dedup_key(ev: LogEvent) -> tuple:
@@ -436,7 +444,7 @@ class ServerMonitor:
                     #    emits one matching line per thread / init step.
                     existing_lines = {e.raw_line for e in phase.events}
                     seen_content_keys: set = {
-                        (e.kind, int(e.timestamp), _THREAD_RE.sub("", e.raw_line))
+                        (e.kind, int(e.timestamp), _THREAD_RE.sub(r"[\1]", e.raw_line))
                         for e in phase.events
                     }
                     seen_restart_keys = {
@@ -450,7 +458,7 @@ class ServerMonitor:
                         content_key = (
                             ev.kind,
                             int(ev.timestamp),
-                            _THREAD_RE.sub("", ev.raw_line),
+                            _THREAD_RE.sub(r"[\1]", ev.raw_line),
                         )
                         if content_key in seen_content_keys:
                             continue

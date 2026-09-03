@@ -152,14 +152,22 @@ _RESTART_PATTERN = re.compile(
     re.I,
 )
 
-# Number extraction helper
+# Number extraction helper.
+# Matches FD breakdown in both known Ganesha log formats:
+#   Standard:  "total=18000 global=18000 state=0 temp=0"
+#   GPFS/RHEL9: "total_fds=18000 global_fds=18000 state_fds=0 temp_fds=0"
+#               "(total_fds=18000 (was 12002), global_fds=18000 (was 12002), ...)"
+# The (?:_fds?)? suffix makes the _fds part optional so both variants match.
 _FD_NUMS = re.compile(
-    r"total[=:\s]+(\d+).*?global[=:\s]+(\d+).*?state[=:\s]+(\d+).*?temp[=:\s]+(\d+)",
+    r"total(?:_fds?)?\s*[=:]\s*(\d+)"
+    r".*?global(?:_fds?)?\s*[=:]\s*(\d+)"
+    r".*?state(?:_fds?)?\s*[=:]\s*(\d+)"
+    r".*?temp(?:_fds?)?\s*[=:]\s*(\d+)",
     re.I | re.S,
 )
-_SINGLE_NUM = re.compile(r"\b(\d+)\b")
-_HIWAT_NUM  = re.compile(r"hiwat[=:\s]+(\d+)", re.I)
-_LOWAT_NUM  = re.compile(r"lowat[=:\s]+(\d+)", re.I)
+_SINGLE_NUM   = re.compile(r"\b(\d+)\b")
+_HIWAT_NUM    = re.compile(r"hiwat[=:\s]+(\d+)", re.I)
+_LOWAT_NUM    = re.compile(r"lowat[=:\s]+(\d+)", re.I)
 _FUTILITY_CNT = re.compile(r"futility[=:\s]+(\d+)", re.I)
 
 
