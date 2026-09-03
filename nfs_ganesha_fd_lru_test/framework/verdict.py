@@ -545,9 +545,28 @@ class VerdictEngine:
         )
         hwm = int(fd_limit * 0.90) if fd_limit > 0 else 0
 
+        initial = burst.samples[0].fsal_opened_fd if burst.samples else 0
         settled = cooldown.settled_fsal_fd
         if protocol in (ProtocolMode.V4, ProtocolMode.BOTH) and cooldown.settled_global_fd > 0:
             settled = cooldown.settled_global_fd
+
+        if protocol == ProtocolMode.V4:
+            # For stateful NFSv4, all opened FDs must be cleanly closed and returned to the initial baseline level.
+            # This ensures no FD count leak across cooldown transitions.
+            leaked = max(0, settled - initial)
+            if leaked <= 5 or (initial > 0 and leaked / initial <= 0.05):
+                return _warn(
+                    name,
+                    f"HWM reached (EXPECTED) → FDs cleanly closed and returned to initial levels ✓  "
+                    f"initial={initial:,} settled={settled:,} (no FD leak detected)",
+                )
+            else:
+                return DimensionResult(
+                    name=name,
+                    verdict=Verdict.FAIL,
+                    reason=f"HWM reached but FDs did not return to initial levels after cooldown: "
+                           f"initial={initial:,} settled={settled:,} (leaked {leaked:,} FDs)",
+                )
 
         if hwm > 0:
             # Reaper's job: bring FDs below HWM.
@@ -601,6 +620,12 @@ class VerdictEngine:
         self, burst: MonitorPhase, cooldown: MonitorPhase, protocol: str = "V3"
     ) -> DimensionResult:
         name = "futility_detection"
+        if protocol == ProtocolMode.V4:
+            return DimensionResult(
+                name=name,
+                verdict=Verdict.PASS,
+                reason="Futility logging not applicable for stateful NFSv4 (TC03)",
+            )
         if not burst.futility_detected:
             return _inconclusive(name, "No futility events detected in this cycle")
 

@@ -175,8 +175,8 @@ class ReportBuilder:
             ts = time.strftime("%H:%M:%S", time.localtime(ev.timestamp))
             self._ln(
                 f"  [{ts}] {ev.kind.name:<22} "
-                f"total={ev.total_fd:>8,} global={ev.global_fd:>8,} "
-                f"state={ev.state_fd:>8,} temp={ev.temp_fd:>8,}  "
+                f"total={ev.total_fd:,} global={ev.global_fd:,} "
+                f"state={ev.state_fd:,} temp={ev.temp_fd:,}  "
                 f"{ev.message[:80]}"
             )
 
