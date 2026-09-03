@@ -25,6 +25,10 @@ import json
 import logging
 import os
 import pathlib
+try:
+    import resource
+except ImportError:
+    resource = None
 import random
 import string
 import tempfile
@@ -232,21 +236,42 @@ def _run_thread(
 
     while not stop_event.is_set():
         fname = random.choice(file_names)
-        stats.opens_attempted += 1
         fh = None
         try:
             if is_v4 and fname in open_fhs:
                 fh = open_fhs[fname]
             else:
+                stats.opens_attempted += 1
                 def _open():
                     return open(fname, "r+b")
 
-                fh = with_retry(
-                    _open,
-                    timeout_sec=retry_timeout,
-                    interval_sec=retry_interval,
-                    stats=stats,
-                )
+                try:
+                    fh = with_retry(
+                        _open,
+                        timeout_sec=retry_timeout,
+                        interval_sec=retry_interval,
+                        stats=stats,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.EMFILE and is_v4 and open_fhs:
+                        # Cache eviction: close the oldest open file descriptor to free a slot on the client
+                        oldest_name, oldest_fh = next(iter(open_fhs.items()))
+                        try:
+                            oldest_fh.close()
+                            stats.closes += 1
+                        except OSError:
+                            pass
+                        del open_fhs[oldest_name]
+                        # Retry the open operation exactly once
+                        fh = with_retry(
+                            _open,
+                            timeout_sec=retry_timeout,
+                            interval_sec=retry_interval,
+                            stats=stats,
+                        )
+                    else:
+                        raise
+
                 stats.opens_succeeded += 1
                 if is_v4:
                     open_fhs[fname] = fh
@@ -314,6 +339,10 @@ def _bump_error_counter(stats: WorkloadStats, category: str) -> None:
 _REMOTE_WORKER_SCRIPT = r'''#!/usr/bin/env python3
 """Self-contained NFS burst worker.  Reads JSON config from stdin, writes JSON stats to stdout."""
 import errno, json, os, pathlib, random, string, sys, threading, time
+try:
+    import resource
+except ImportError:
+    resource = None
 
 def _random_name(prefix="f", length=8):
     return prefix + "".join(random.choices(string.ascii_lowercase, k=length))
@@ -363,12 +392,12 @@ def _run_thread(tid, mount_point, subdir, stop_event, stats, num_files, file_siz
     is_v4 = protocol.lower() == "v4"
     while not stop_event.is_set():
         fname = random.choice(file_names)
-        stats["opens_attempted"] += 1
         fh = None
         try:
             if is_v4 and fname in open_fhs:
                 fh = open_fhs[fname]
             else:
+                stats["opens_attempted"] += 1
                 deadline = time.monotonic() + retry_timeout
                 attempts = 0
                 last_exc = None
@@ -377,6 +406,13 @@ def _run_thread(tid, mount_point, subdir, stop_event, stats, num_files, file_siz
                         fh = open(fname, "r+b"); break
                     except OSError as exc:
                         cat = _classify(exc)
+                        if cat == "EMFILE" and is_v4 and open_fhs:
+                            # Cache eviction: close oldest to free slot and retry immediately
+                            oldest_name, oldest_fh = next(iter(open_fhs.items()))
+                            try: oldest_fh.close(); stats["closes"] += 1
+                            except OSError: pass
+                            del open_fhs[oldest_name]
+                            continue
                         if cat not in ("EIO", "ENFILE"):
                             raise
                         last_exc = exc; attempts += 1
@@ -415,6 +451,13 @@ def _bump(stats, cat):
     else:                 stats["other_errors"] += 1
 
 def main():
+    if resource is not None:
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except Exception:
+            pass
+
     cfg = json.load(sys.stdin)
     mount_point      = cfg["mount_point"]
     num_threads      = cfg["num_threads"]
@@ -610,6 +653,15 @@ class WorkloadWorker:
         Execute one burst cycle.
 
         1. Open held handles.
+        """
+        if resource is not None:
+            try:
+                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            except Exception:
+                pass
+
+        """
         2. Launch worker threads.
         3. Let workload run for burst_duration_sec.
         4. Validate held handles.
