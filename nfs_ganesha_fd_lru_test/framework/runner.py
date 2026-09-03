@@ -456,6 +456,12 @@ class BaseScenario:
         if fd_limit > 0:
             self.setup_pressure_config(fd_limit, len(self.config.clients))
 
+        # Anchor the log-event filter to the server's clock right before the
+        # first cycle begins.  This eliminates controller-vs-server clock skew:
+        # the cutoff is the server's own epoch, so log timestamps (which are
+        # in the server's local time) are compared in the same time domain.
+        self.monitor.calibrate_server_time()
+
         # Cycles
         cycle_verdicts: List[CycleVerdict] = []
         all_burst_phases: List[MonitorPhase] = []

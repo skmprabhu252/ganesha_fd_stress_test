@@ -875,10 +875,13 @@ class TestServerMonitorTimestampFilter(unittest.TestCase):
     """
     Verify that log events predating _test_start_time are silently dropped
     and never reach phase.events — even when the raw_line is unique.
+
+    _test_start_time is now the **server-side epoch** set by
+    calibrate_server_time(), not a controller-time estimate.  Before
+    calibration, _test_start_time is None and all events are accepted.
     """
 
     def _make_monitor(self):
-        from unittest.mock import MagicMock
         from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor
         from nfs_ganesha_fd_lru_test.framework.config import ServerConfig
         cfg = ServerConfig(address="srv", ssh_address="srv")
@@ -886,24 +889,60 @@ class TestServerMonitorTimestampFilter(unittest.TestCase):
         ssh.run_remote.return_value = MagicMock(ok=False, stdout="", stderr="")
         return ServerMonitor(cfg, ssh)
 
+    def _make_monitor_calibrated(self, server_epoch: float):
+        """Return a monitor whose _test_start_time is pre-set to server_epoch."""
+        monitor = self._make_monitor()
+        monitor._test_start_time = server_epoch
+        return monitor
+
+    def test_test_start_time_is_none_before_calibration(self):
+        """Before calibrate_server_time(), _test_start_time must be None."""
+        monitor = self._make_monitor()
+        self.assertIsNone(monitor._test_start_time)
+
+    def test_calibrate_server_time_ok(self):
+        """calibrate_server_time() stores the epoch returned by the server."""
+        import time as _time
+        from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor
+        from nfs_ganesha_fd_lru_test.framework.config import ServerConfig
+        cfg = ServerConfig(address="srv", ssh_address="srv")
+        ssh = MagicMock()
+        expected = int(_time.time()) - 5
+        ssh.run_remote.return_value = MagicMock(ok=True, stdout=str(expected), stderr="")
+        monitor = ServerMonitor(cfg, ssh)
+        monitor.calibrate_server_time()
+        self.assertEqual(monitor._test_start_time, float(expected))
+
+    def test_calibrate_server_time_ssh_fail_falls_back(self):
+        """calibrate_server_time() falls back to controller time on SSH failure."""
+        import time as _time
+        monitor = self._make_monitor()   # ssh.run_remote returns ok=False
+        before = _time.time()
+        monitor.calibrate_server_time()
+        after = _time.time()
+        self.assertIsNotNone(monitor._test_start_time)
+        self.assertGreaterEqual(monitor._test_start_time, before)
+        self.assertLessEqual(monitor._test_start_time, after)
+
     def test_historical_event_is_dropped(self):
         """An event timestamped before test start must not enter phase.events."""
-        from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor, MonitorPhase
-        from nfs_ganesha_fd_lru_test.framework.log_parser import LogEvent, LogEventKind
-        monitor = self._make_monitor()
+        import time as _time
+        from nfs_ganesha_fd_lru_test.framework.monitor import MonitorPhase
+        anchor = _time.time()
+        monitor = self._make_monitor_calibrated(anchor)
         phase = MonitorPhase(label="burst_cycle_1")
 
-        # Build a restart event 2 hours before the monitor was created
+        # Build a restart event 2 hours before the calibration anchor
         old_ev = LogEvent(
             kind=LogEventKind.GANESHA_RESTART,
-            timestamp=monitor._test_start_time - 7200,
+            timestamp=anchor - 7200,
             raw_line="2026-08-31 19:22:42 : epoch 00023aae : scale2-22 : "
                      "gpfs.ganesha.nfsd-1091341[main] nfs_start :NFS STARTUP "
                      ":EVENT :             NFS SERVER INITIALIZED",
             message="NFS SERVER INITIALIZED",
         )
 
-        # Simulate what _monitor_loop does
+        # Simulate what _monitor_loop does with _test_start_time set
         events = [old_ev]
         with monitor._lock:
             events = [e for e in events if e.timestamp >= monitor._test_start_time]
@@ -918,16 +957,16 @@ class TestServerMonitorTimestampFilter(unittest.TestCase):
 
     def test_current_event_is_kept(self):
         """An event timestamped after test start must enter phase.events."""
-        from nfs_ganesha_fd_lru_test.framework.monitor import ServerMonitor, MonitorPhase
-        from nfs_ganesha_fd_lru_test.framework.log_parser import LogEvent, LogEventKind
         import time as _time
-        monitor = self._make_monitor()
+        from nfs_ganesha_fd_lru_test.framework.monitor import MonitorPhase
+        anchor = _time.time()
+        monitor = self._make_monitor_calibrated(anchor)
         phase = MonitorPhase(label="burst_cycle_1")
 
-        # Build a restart event 10 seconds after the monitor was created
+        # Build an event 10 seconds after the calibration anchor
         new_ev = LogEvent(
             kind=LogEventKind.GANESHA_RESTART,
-            timestamp=monitor._test_start_time + 10,
+            timestamp=anchor + 10,
             raw_line="2026-08-31 21:34:55 : epoch 00023aae : scale2-22 : "
                      "gpfs.ganesha.nfsd-1091342[main] nfs_start :NFS STARTUP "
                      ":EVENT :             NFS SERVER INITIALIZED",
@@ -946,13 +985,32 @@ class TestServerMonitorTimestampFilter(unittest.TestCase):
         self.assertEqual(len(phase.events), 1,
                          "Current-test event must be kept")
 
-    def test_test_start_time_is_in_recent_past(self):
-        """_test_start_time should be within ~65 seconds of now."""
+    def test_no_filter_when_not_calibrated(self):
+        """When _test_start_time is None, all events must be accepted."""
         import time as _time
-        monitor = self._make_monitor()
-        age = _time.time() - monitor._test_start_time
-        self.assertGreater(age, 0, "_test_start_time must be in the past")
-        self.assertLess(age, 120, "_test_start_time must be recent (within 2 min)")
+        from nfs_ganesha_fd_lru_test.framework.monitor import MonitorPhase
+        monitor = self._make_monitor()   # _test_start_time is None
+        self.assertIsNone(monitor._test_start_time)
+        phase = MonitorPhase(label="burst_cycle_1")
+
+        old_ev = LogEvent(
+            kind=LogEventKind.HIGH_WATERMARK,
+            timestamp=_time.time() - 9999,
+            raw_line="old high watermark event",
+        )
+        events = [old_ev]
+        # Replicate the None-guard in _monitor_loop
+        with monitor._lock:
+            if monitor._test_start_time is not None:
+                events = [e for e in events if e.timestamp >= monitor._test_start_time]
+            existing_lines = {e.raw_line for e in phase.events}
+            for ev in events:
+                if ev.raw_line not in existing_lines:
+                    phase.events.append(ev)
+                    existing_lines.add(ev.raw_line)
+
+        self.assertEqual(len(phase.events), 1,
+                         "All events must be accepted when _test_start_time is None")
 
 
 

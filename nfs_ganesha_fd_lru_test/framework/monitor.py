@@ -29,6 +29,13 @@ from .ssh_client import SSHClient
 
 logger = logging.getLogger(__name__)
 
+
+def _fmt_epoch(epoch: float) -> str:
+    """Format a Unix epoch as HH:MM:SS in local time — for log messages only."""
+    import datetime
+    return datetime.datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
+
+
 # ---------------------------------------------------------------------------
 # Restart event deduplication key
 # ---------------------------------------------------------------------------
@@ -215,6 +222,7 @@ class ServerMonitor:
     Usage::
 
         monitor = ServerMonitor(server_cfg, ssh_client)
+        monitor.calibrate_server_time()   # anchors log filter to server clock
         phase = monitor.start_phase("burst")
         ... run workload ...
         monitor.stop_phase(phase)
@@ -240,16 +248,66 @@ class ServerMonitor:
         self._stats_unavailable_since: Optional[float] = None
         self.stats_unavailable = False
 
-        # Record the moment this monitor was created.  Any log event whose
-        # parsed timestamp predates this point is from a previous test run or
-        # a historical startup and must be silently discarded — the monitor
-        # uses `tail -n N` with no seek cursor, so every poll re-reads the
-        # same historical tail of the log file.
-        # A 60-second tolerance is subtracted to cover:
-        #   • clock skew between the orchestrator and the Ganesha server
-        #   • the baseline collection window (~15 s) that happens before
-        #     cycle 1 starts (events from that window ARE relevant)
-        self._test_start_time: float = time.time() - 60.0
+        # _test_start_time is the server-side Unix epoch at the moment the
+        # test begins.  Any log event whose parsed timestamp predates this
+        # value is pre-test history and must be discarded.
+        #
+        # Initialised to None.  calibrate_server_time() must be called before
+        # the first monitoring phase starts; if it is not called (e.g. in unit
+        # tests that don't have SSH) the filter falls back to accepting all events.
+        self._test_start_time: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Server-clock calibration
+    # ------------------------------------------------------------------
+
+    def calibrate_server_time(self) -> None:
+        """
+        Fetch the current Unix epoch from the Ganesha server via SSH and
+        store it as ``_test_start_time``.
+
+        This anchors the log-event filter to the **server's own clock**,
+        eliminating any controller-vs-server clock skew.  Log lines whose
+        parsed timestamp predates this value are considered pre-test history
+        (previous runs, old LRU messages, etc.) and are silently discarded.
+
+        Must be called once before the first :meth:`start_phase` call.
+        If the SSH command fails, falls back to ``time.time()`` on the
+        controller so the test can still proceed — a warning is logged.
+        """
+        result = self.ssh.run_remote(
+            self.server.ssh_host,
+            "date +%s",
+            timeout=10,
+        )
+        if result.ok:
+            try:
+                server_epoch = float(result.stdout.strip())
+                self._test_start_time = server_epoch
+                logger.info(
+                    "Server time calibrated: server_epoch=%.0f (%s)  "
+                    "— log events before this timestamp will be discarded",
+                    server_epoch,
+                    _fmt_epoch(server_epoch),
+                )
+                return
+            except ValueError:
+                logger.warning(
+                    "Could not parse server epoch from %r — falling back to controller time",
+                    result.stdout.strip(),
+                )
+        else:
+            logger.warning(
+                "SSH 'date +%%s' failed on %s (%s) — falling back to controller time",
+                self.server.ssh_host, result.stderr,
+            )
+        # Fallback: use controller's local time
+        self._test_start_time = time.time()
+        logger.info(
+            "Server time fallback: using controller epoch=%.0f (%s)",
+            self._test_start_time,
+            _fmt_epoch(self._test_start_time),
+        )
 
     # ------------------------------------------------------------------
     # Internal polling
@@ -302,11 +360,26 @@ class ServerMonitor:
                 with self._lock:
                     # Drop events that predate this test run.
                     # The log is read with `tail -n N` (no cursor), so every
-                    # poll re-reads historical entries from previous runs.
-                    # Any event whose timestamp is before _test_start_time is
-                    # stale and must not influence verdicts.
-                    events = [e for e in events
-                               if e.timestamp >= self._test_start_time]
+                    # poll re-reads the same historical tail on every iteration.
+                    # _test_start_time is the server-side epoch captured by
+                    # calibrate_server_time() just before the test began — so
+                    # the comparison is entirely in the server's own time domain
+                    # and is immune to controller-vs-server clock skew.
+                    # When _test_start_time is None (unit tests / no SSH),
+                    # accept all events.
+                    if self._test_start_time is not None:
+                        dropped = [e for e in events
+                                   if e.timestamp < self._test_start_time]
+                        if dropped:
+                            logger.debug(
+                                "Dropped %d pre-test log event(s) "
+                                "(oldest server time=%s, test started=%s)",
+                                len(dropped),
+                                _fmt_epoch(min(e.timestamp for e in dropped)),
+                                _fmt_epoch(self._test_start_time),
+                            )
+                        events = [e for e in events
+                                  if e.timestamp >= self._test_start_time]
 
                     # De-duplicate events so the verdict engine sees clean counts.
                     #
