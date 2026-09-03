@@ -333,14 +333,14 @@ class VerdictEngine:
         self, burst: MonitorPhase, cooldown: MonitorPhase
     ) -> DimensionResult:
         """
-        NFSv4-specific check: state FDs must drop after cooldown.
+        NFSv4-specific check: state FDs must return to initial levels after cooldown.
 
         State FDs represent open-state records maintained by Ganesha on behalf
         of NFSv4 clients.  They are closed by the client via the CLOSE
         operation — the LRU has no authority to reclaim them.
 
         After the burst workload finishes and clients close their files,
-        state_fd should return close to its pre-burst baseline.  If it
+        state_fd should return back to its pre-burst baseline.  If it
         stays elevated, it indicates either an NFSv4 state leak or clients
         that did not cleanly close their connections.
 
@@ -352,8 +352,9 @@ class VerdictEngine:
         if not burst.samples or not cooldown.samples:
             return _inconclusive(name, "Insufficient samples to evaluate V4 state FD closure")
 
-        peak_state    = max((s.state_fd for s in burst.samples), default=0)
+        initial_state = burst.samples[0].state_fd
         settled_state = cooldown.samples[-1].state_fd
+        peak_state    = max((s.state_fd for s in burst.samples), default=0)
 
         if peak_state == 0:
             return _inconclusive(
@@ -362,29 +363,35 @@ class VerdictEngine:
                 "V4 state FD closure cannot be evaluated independently",
             )
 
-        closure_pct = (peak_state - settled_state) / peak_state * 100.0
+        # Ensure no state FD leak: settled_state must return back to initial_state.
+        # We allow a small tolerance of up to 5 FDs or 1.0% of peak_state to avoid
+        # noise from concurrent system locks/tasks.
+        leaked_fds = max(0, settled_state - initial_state)
+        leak_percentage_of_peak = (leaked_fds / peak_state) * 100.0 if peak_state > 0 else 0.0
 
-        if closure_pct >= 80.0:
+        if leaked_fds <= 5 or leak_percentage_of_peak <= 1.0:
             return DimensionResult(
                 name=name,
                 verdict=Verdict.PASS,
-                reason=f"V4 state FDs closed by clients: {closure_pct:.1f}% released "
-                       f"after cooldown ({peak_state:,} → {settled_state:,})",
+                reason=f"V4 state FDs cleanly closed: initial={initial_state:,}, "
+                       f"peak={peak_state:,}, settled={settled_state:,} (no FD leak detected)",
             )
-        if closure_pct >= 40.0:
+        elif leak_percentage_of_peak <= 5.0:
             return DimensionResult(
                 name=name,
                 verdict=Verdict.WARNING,
-                reason=f"Partial V4 state FD closure: {closure_pct:.1f}% released — "
-                       f"some clients may not have closed cleanly "
-                       f"({peak_state:,} → {settled_state:,})",
+                reason=f"Minor V4 state FD leak detected: settled state={settled_state:,} "
+                       f"exceeds initial={initial_state:,} (leaked {leaked_fds:,} FDs, "
+                       f"{leak_percentage_of_peak:.1f}% of peak)",
             )
-        return DimensionResult(
-            name=name,
-            verdict=Verdict.FAIL,
-            reason=f"V4 state FDs NOT released after cooldown: only {closure_pct:.1f}% closed "
-                   f"({peak_state:,} → {settled_state:,}) — possible NFSv4 state leak",
-        )
+        else:
+            return DimensionResult(
+                name=name,
+                verdict=Verdict.FAIL,
+                reason=f"V4 state FD leak detected: settled state={settled_state:,} "
+                       f"exceeds initial={initial_state:,} (leaked {leaked_fds:,} FDs, "
+                       f"{leak_percentage_of_peak:.1f}% of peak)",
+            )
 
     def check_fd_settled(self, cooldown: MonitorPhase) -> DimensionResult:
         name = "fd_settled_after_cooldown"

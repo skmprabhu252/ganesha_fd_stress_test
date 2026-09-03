@@ -1185,6 +1185,22 @@ class TestVerdictEngine(unittest.TestCase):
     def test_no_state_pressure_pass(self):
         self.assertEqual(self.e.check_state_fd_pressure(_phase()).verdict, Verdict.PASS)
 
+    def test_v4_state_fd_closure_pass(self):
+        b = MonitorPhase(label="burst")
+        b.samples = [FDSample(state_fd=10, fsal_opened_fd=10), FDSample(state_fd=1000, fsal_opened_fd=1000)]
+        cd = MonitorPhase(label="cooldown")
+        cd.samples = [FDSample(state_fd=10, fsal_opened_fd=10)]
+        r = self.e.check_v4_state_fd_closure(b, cd)
+        self.assertEqual(r.verdict, Verdict.PASS)
+
+    def test_v4_state_fd_closure_fail(self):
+        b = MonitorPhase(label="burst")
+        b.samples = [FDSample(state_fd=10, fsal_opened_fd=10), FDSample(state_fd=1000, fsal_opened_fd=1000)]
+        cd = MonitorPhase(label="cooldown")
+        cd.samples = [FDSample(state_fd=500, fsal_opened_fd=500)]
+        r = self.e.check_v4_state_fd_closure(b, cd)
+        self.assertEqual(r.verdict, Verdict.FAIL)
+
     # §31 server monitoring
     def test_monitoring_fail_no_samples(self):
         self.assertEqual(self.e.check_server_monitoring([MonitorPhase(label="b")]).verdict, Verdict.FAIL)
