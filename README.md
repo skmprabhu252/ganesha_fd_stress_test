@@ -11,7 +11,7 @@ via SSH.
 
 | ID   | Name              | Protocol | Description |
 |------|-------------------|----------|-------------|
-| TC01 | Sanity            | Any      | Environment validation + minimal smoke test |
+| TC01 | Sanity            | Any      | Environment validation + minimal FD lifecycle smoke test |
 | TC02 | NFSv3 Full Stress | V3       | Complete V3 FD/LRU lifecycle — watermark, reaper, reclamation, retention, active handles |
 | TC03 | NFSv4 Full Stress | V4       | V4 FD/LRU lifecycle + state-FD closure validation |
 | TC04 | Mixed Stress      | V3+V4    | Concurrent V3+V4 workload, dual-category FD pressure |
@@ -36,6 +36,7 @@ Use `--cycles N` to override the cycle count for any mode without changing other
   server and all client nodes
 - NFS clients must be able to mount from the Ganesha server
 - `ganesha_stats` command available on the Ganesha server
+- Either `ganesha.nfsd` or `gpfs.ganesha.nfsd` (GPFS builds) on the server
 
 ---
 
@@ -49,6 +50,12 @@ Or run directly without installing:
 
 ```bash
 python -m nfs_ganesha_fd_lru_test.main --help
+```
+
+A console-script entry-point is also registered by `pyproject.toml`:
+
+```bash
+nfs-ganesha-fd-lru-test --server ganesha-node1 --export /export --clients client-1
 ```
 
 ---
@@ -94,6 +101,24 @@ python -m nfs_ganesha_fd_lru_test.main \
     --scenario TC03 --mode soak -v
 ```
 
+### Negative stress test — target 150 % of FD limit
+
+Intentionally drives Ganesha beyond its hard FD limit to test hard-limit
+recovery and futility detection. Pass any value > 1.0 to `--target-fd-ratio`:
+
+```bash
+python -m nfs_ganesha_fd_lru_test.main \
+    --server          ganesha-node1 \
+    --export          /export \
+    --clients         client-1,client-2,client-3 \
+    --scenario        TC02 \
+    --target-fd-ratio 1.50
+```
+
+With a server FD limit of 20 000 this allocates `target_fds = 30 000` concurrent
+FDs, pushing Ganesha past its hard limit and exercising hard-limit / futility
+recovery paths. The default (`0.95`) stays below the limit for standard FVT runs.
+
 ### OpenStack / VIP topology
 
 When the Ganesha server is behind a VIP (floating-IP) and the real physical
@@ -129,9 +154,34 @@ python -m nfs_ganesha_fd_lru_test.main \
 | `--files` | `200` | Base files per thread (scaled by mode multiplier) |
 | `--file-size` | `4096` | File size in bytes |
 | `--fd-tolerance` | `10.0` | Max allowed settled-FD growth % across cycles |
+| `--target-fd-ratio` | `0.95` | Target open FDs relative to server FD limit. Use `> 1.0` (e.g. `1.50`) for negative stress tests that intentionally exceed the hard limit |
 | `--server-log` | `/var/log/ganesha.log` | Path to Ganesha log on the server |
 | `--report-file` | _(stdout)_ | Write final report to this file |
 | `-v` / `--verbose` | `False` | Enable DEBUG logging |
+
+---
+
+## Pressure Scaling
+
+After collecting baseline FD samples, `setup_pressure_config()` (called in
+TC02, TC03, and TC04) scales `threads_per_client` and `num_files` so that the
+estimated peak concurrent open FD count reaches exactly
+`config.target_fd_ratio × system_fd_limit`.
+
+```
+peak_fds ≈ num_clients × threads × files_per_thread = target_fd_ratio × fd_limit
+```
+
+The ratio is read from `TestConfig.target_fd_ratio`, which is populated by
+`--target-fd-ratio` on the command line (default `0.95`). This means:
+
+| `--target-fd-ratio` | Effect |
+|---------------------|--------|
+| `0.95` (default) | Stay 5 % below the limit — reliably trigger HWM (90 %) without crashing |
+| `1.00` | Target exactly the hard limit |
+| `1.50` | 50 % over — exercises hard-limit / futility recovery (negative test) |
+
+`fast` mode bypasses pressure scaling entirely (smoke test only).
 
 ---
 
@@ -182,6 +232,23 @@ The framework's verdict logic is built around Ganesha's LRU reaper thread design
 | `no_mount_loss` | ESTALE rate below 5 % of opens |
 | `client_fd_exhaustion` | EMFILE (client FD exhaustion) distinguished from server-side pressure |
 | `v4_state_fd_closure` | (V4/BOTH only) State FDs released by clients after cooldown |
+| `state_fd_pressure` | (V4/BOTH only) State FD warnings classified as WARNING/DIAGNOSTIC, not FAIL |
+
+---
+
+## TestConfig Parameters
+
+Key fields on `TestConfig` (beyond server/clients/workload sub-configs):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `protocol` | `BOTH` | Protocol mode: `V3`, `V4`, or `BOTH` |
+| `num_cycles` | `6` | Number of burst–cooldown cycles |
+| `num_cycles_override` | `None` | If set, overrides the mode-default cycle count |
+| `fd_tolerance_pct` | `10.0` | Max allowed settled-FD growth % across cycles |
+| `fd_accounting_tolerance` | `100` | Allowed discrepancy in `total ≈ global + state + temp` identity |
+| `target_fd_ratio` | `0.95` | Target open FDs as a fraction of the server FD limit |
+| `scenario` | `""` | Scenario filter; empty = run all |
 
 ---
 
@@ -189,26 +256,28 @@ The framework's verdict logic is built around Ganesha's LRU reaper thread design
 
 ```
 nfs_ganesha_fd_lru_test/
-├── main.py                  # CLI entry-point
+├── main.py                  # CLI entry-point (_parse_args, _build_config, main)
 ├── framework/               # Core test infrastructure
-│   ├── config.py            # Configuration dataclasses
-│   ├── fd_stats.py          # ganesha_stats parser + FDSample model
-│   ├── log_parser.py        # Ganesha log event parser
-│   ├── monitor.py           # Background server monitor (FD + log)
-│   ├── preflight.py         # Pre-flight environment checks
-│   ├── report.py            # Human-readable report builder
-│   ├── runner.py            # Cycle runner + BaseScenario
-│   ├── ssh_client.py        # SSH/SCP helpers
-│   ├── verdict.py           # Verdict engine (per-dimension + suite)
-│   └── workload.py          # NFS burst workload + remote worker script
+│   ├── config.py            # Configuration dataclasses (ServerConfig, ClientConfig,
+│   │                        #   WorkloadConfig, TestConfig, ProtocolMode)
+│   ├── fd_stats.py          # ganesha_stats parser + FDSample model + BaselineStats
+│   ├── log_parser.py        # Ganesha log event parser (LogEvent, LogEventKind)
+│   ├── monitor.py           # Background server monitor (ServerMonitor, MonitorPhase)
+│   ├── preflight.py         # Pre-flight environment checks (PreflightReport)
+│   ├── report.py            # Human-readable + JSON report builder (ReportBuilder)
+│   ├── runner.py            # CycleRunner + BaseScenario base class
+│   ├── ssh_client.py        # SSH/SCP helpers (SSHClient, RemoteResult)
+│   ├── verdict.py           # Verdict engine (VerdictEngine, CycleVerdict, SuiteVerdict)
+│   └── workload.py          # NFS burst workload engine (WorkloadWorker, WorkloadStats,
+│                            #   HeldHandle)
 ├── scenarios/               # TC01–TC04 test scenario implementations
 │   ├── mode.py              # RunMode + ModeProfile definitions
-│   ├── registry.py          # Scenario registry
-│   ├── tc01_sanity.py
-│   ├── tc02_v3_stress.py
-│   ├── tc03_v4_stress.py
-│   └── tc04_mixed_stress.py
-└── tests/                   # Unit tests (pytest)
+│   ├── registry.py          # Scenario registry (ALL_SCENARIOS, SCENARIO_MAP, get_scenario)
+│   ├── tc01_sanity.py       # TC01 — environment smoke test (always 1 cycle, fast profile)
+│   ├── tc02_v3_stress.py    # TC02 — NFSv3 full stress (pressure scaling + adaptive cycles)
+│   ├── tc03_v4_stress.py    # TC03 — NFSv4 full stress (state-FD tracking, futility bypass)
+│   └── tc04_mixed_stress.py # TC04 — V3+V4 concurrent stress (2 workers/client)
+└── tests/                   # Unit tests (unittest / pytest)
     └── test_fd_lru_framework.py
 ```
 
@@ -217,10 +286,19 @@ nfs_ganesha_fd_lru_test/
 ## Running Unit Tests
 
 ```bash
+# via pytest (recommended — uses pyproject.toml test config):
 pytest
-# or verbosely:
-python -m pytest nfs_ganesha_fd_lru_test/tests/test_fd_lru_framework.py -v
+
+# verbosely:
+pytest nfs_ganesha_fd_lru_test/tests/test_fd_lru_framework.py -v
+
+# via unittest directly:
+python -m unittest nfs_ganesha_fd_lru_test/tests/test_fd_lru_framework.py -v
 ```
+
+The test suite is self-contained — no real Ganesha server or NFS mount is needed.
+All SSH calls and filesystem operations are mocked. The suite currently covers
+**217 tests** across all framework modules and scenario configurations.
 
 ---
 
