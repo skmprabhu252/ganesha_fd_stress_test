@@ -152,6 +152,7 @@ class TestConfig:
     num_cycles_override: Optional[int] = None
     fd_tolerance_pct: float = 10.0       # % increase allowed across settled cycles
     fd_accounting_tolerance: int = 100   # allowed discrepancy total ≈ global+state+temp
+    target_fd_ratio: float = 0.95        # target open FDs relative to server limit (e.g. 1.50 for 150%)
     scenario: str = ""                   # e.g. "TC01", "TC04" — empty = all
 
     def validate(self) -> None:

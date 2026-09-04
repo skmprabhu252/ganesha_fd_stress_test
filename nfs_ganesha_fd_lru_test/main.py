@@ -112,6 +112,9 @@ def _parse_args(argv=None):
     # Thresholds
     p.add_argument("--fd-tolerance", type=float, default=10.0,
                    help="Allowed settled-FD increase %% across cycles")
+    p.add_argument("--target-fd-ratio", type=float, default=0.95,
+                   help="Target open FDs relative to server limit "
+                        "(e.g. 1.50 for 150%% — use >1.0 for negative stress tests)")
 
     # Output
     p.add_argument("--report-file", default="",
@@ -151,6 +154,7 @@ def _build_config(args) -> TestConfig:
         ),
         num_cycles_override=getattr(args, "cycles", 0) if getattr(args, "cycles", 0) > 0 else None,
         fd_tolerance_pct=args.fd_tolerance,
+        target_fd_ratio=getattr(args, "target_fd_ratio", 0.95),
     )
 
 

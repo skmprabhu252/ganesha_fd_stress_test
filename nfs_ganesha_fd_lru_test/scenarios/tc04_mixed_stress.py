@@ -85,13 +85,13 @@ class TC04_Mixed_Stress(BaseScenario):
 
     def setup_pressure_config(self, fd_limit: int, num_clients: int) -> None:
         """
-        Scale threads/files to reach _TARGET_FD_RATIO × fd_limit.
+        Scale threads/files to reach config.target_fd_ratio × fd_limit.
         For BOTH protocol, total concurrent workers = num_clients × 2 (v3+v4).
         """
         if self._mode == RunMode.FAST:
             return
         wl = self.config.workload
-        target_fds = int(fd_limit * self._TARGET_FD_RATIO)
+        target_fds = int(fd_limit * self.config.target_fd_ratio)
         total_workers = num_clients * self._WORKERS_PER_CLIENT
         threads = wl.threads_per_client
         needed_files = max(1, target_fds // max(1, total_workers * threads))

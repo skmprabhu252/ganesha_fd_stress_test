@@ -94,7 +94,7 @@ class TC02_NFSv3_Stress(BaseScenario):
     def setup_pressure_config(self, fd_limit: int, num_clients: int) -> None:
         """
         Scale threads and files so the concurrent open count reaches
-        _TARGET_FD_RATIO × fd_limit, distributing evenly across clients.
+        config.target_fd_ratio × fd_limit, distributing evenly across clients.
 
         Peak concurrent FDs ≈ num_clients × threads × files_per_thread.
         Solving for files_per_thread (keeping threads fixed):
@@ -106,7 +106,7 @@ class TC02_NFSv3_Stress(BaseScenario):
             return   # fast mode is a smoke test — no pressure scaling
 
         wl = self.config.workload
-        target_fds = int(fd_limit * self._TARGET_FD_RATIO)
+        target_fds = int(fd_limit * self.config.target_fd_ratio)
         threads = wl.threads_per_client
         needed_files = max(1, target_fds // max(1, num_clients * threads))
 
