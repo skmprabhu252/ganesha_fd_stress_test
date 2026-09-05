@@ -251,6 +251,97 @@ def parse_ganesha_stats(output: str) -> FDSample:
     return sample
 
 
+def parse_dbus_fd_usage(output: str) -> FDSample:
+    """
+    Parse the output of dbus-send ShowFDUsage command into a :class:`FDSample`.
+
+    Expected format:
+        method return time=1788647786.969864 sender=:1.1007353 -> destination=:1.1032548 serial=26575 reply_serial=2
+           boolean true
+           string "OK"
+           struct {
+              uint64 1788647786
+              uint64 969291083
+           }
+           struct {
+              string "System limit on FDs"
+              uint32 20000
+              string "FD Low WaterMark"
+              uint32 0
+              string "FD High WaterMark"
+              uint32 12000
+              string "FD Hard Limt"
+              uint32 18000
+              string "FD usage"
+              string "        Below High Water Mark "
+              string "FSAL opened Global FD count"
+              uint32 1774
+              string "FSAL opened State FD count"
+              uint32 0
+              string "NFSv4 open state count"
+              uint64 0
+           }
+    """
+    sample = FDSample(timestamp=time.time(), raw_output=output)
+    
+    # Extract key-value pairs from the dbus struct output
+    # Pattern: string "Key Name" followed by uint32/uint64 value
+    lines = output.split('\n')
+    
+    current_key = None
+    for line in lines:
+        line = line.strip()
+        
+        # Match string keys
+        string_match = re.match(r'string\s+"([^"]+)"', line)
+        if string_match:
+            current_key = string_match.group(1)
+            continue
+        
+        # Match numeric values (uint32 or uint64)
+        value_match = re.match(r'uint(?:32|64)\s+(\d+)', line)
+        if value_match and current_key:
+            value = int(value_match.group(1))
+            
+            # Map dbus keys to FDSample fields
+            key_lower = current_key.lower()
+            
+            if "system limit" in key_lower and "fd" in key_lower:
+                sample.system_fd_limit = value
+            elif "fsal opened global fd" in key_lower:
+                sample.global_fd = value
+            elif "fsal opened state fd" in key_lower:
+                sample.state_fd = value
+            elif "nfsv4 open state count" in key_lower:
+                # This is an alternative measure of state FDs
+                if sample.state_fd == 0:
+                    sample.state_fd = value
+            elif "fd high watermark" in key_lower or "fd high water mark" in key_lower:
+                # Store for reference but not directly used in FDSample
+                pass
+            elif "fd low watermark" in key_lower or "fd low water mark" in key_lower:
+                # Store for reference but not directly used in FDSample
+                pass
+            
+            current_key = None
+    
+    # Calculate total FSAL opened FD count
+    # Total = Global + State (temp_fd not reported in dbus output)
+    sample.fsal_opened_fd = sample.global_fd + sample.state_fd
+    sample.total_fd = sample.fsal_opened_fd
+    
+    # Extract FD usage label if present
+    usage_label_match = re.search(r'string\s+"FD usage"\s+string\s+"([^"]+)"', output, re.IGNORECASE)
+    if usage_label_match:
+        sample.fd_usage_label = usage_label_match.group(1).strip()
+    
+    # Calculate FD usage percentage
+    if sample.system_fd_limit > 0:
+        sample.fd_usage_pct = (sample.fsal_opened_fd / sample.system_fd_limit) * 100.0
+    
+    return sample
+
+
 # ---------------------------------------------------------------------------
 # Baseline analysis
 # ---------------------------------------------------------------------------

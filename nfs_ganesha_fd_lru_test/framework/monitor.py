@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .config import ServerConfig
-from .fd_stats import FDSample, parse_ganesha_stats
+from .fd_stats import FDSample, parse_ganesha_stats, parse_dbus_fd_usage
 from .log_parser import LogEvent, LogEventKind, parse_log_text
 from .ssh_client import SSHClient
 
@@ -359,19 +359,48 @@ class ServerMonitor:
     # ------------------------------------------------------------------
 
     def _poll_stats(self) -> Optional[FDSample]:
-        result = self.ssh.run_remote(
-            self.server.ssh_host,
-            self.server.ganesha_stats_cmd,
-            timeout=15,
-        )
-        if not result.ok:
-            if self._stats_unavailable_since is None:
-                self._stats_unavailable_since = time.monotonic()
-                logger.warning("ganesha_stats unavailable: %s", result.stderr)
-            return None
+        """
+        Poll FD statistics from the Ganesha server.
+        
+        Uses dbus-send ShowFDUsage when use_dbus_fd_stats is True (recommended
+        for accurate FD breakdown during burst I/O), otherwise falls back to
+        ganesha_stats inode parsing.
+        """
+        if self.server.use_dbus_fd_stats:
+            # Use dbus-send for accurate FD statistics during burst/cooldown
+            result = self.ssh.run_remote(
+                self.server.ssh_host,
+                self.server.dbus_fd_stats_cmd,
+                timeout=15,
+            )
+            if not result.ok:
+                if self._stats_unavailable_since is None:
+                    self._stats_unavailable_since = time.monotonic()
+                    logger.warning("dbus FD stats unavailable: %s", result.stderr)
+                return None
+            
+            self._stats_unavailable_since = None
+            try:
+                return parse_dbus_fd_usage(result.stdout)
+            except Exception as exc:
+                logger.error("Failed to parse dbus FD stats output: %s", exc)
+                logger.debug("dbus output was: %s", result.stdout)
+                return None
+        else:
+            # Fallback to ganesha_stats inode
+            result = self.ssh.run_remote(
+                self.server.ssh_host,
+                self.server.ganesha_stats_cmd,
+                timeout=15,
+            )
+            if not result.ok:
+                if self._stats_unavailable_since is None:
+                    self._stats_unavailable_since = time.monotonic()
+                    logger.warning("ganesha_stats unavailable: %s", result.stderr)
+                return None
 
-        self._stats_unavailable_since = None
-        return parse_ganesha_stats(result.stdout)
+            self._stats_unavailable_since = None
+            return parse_ganesha_stats(result.stdout)
 
     def _poll_log(self) -> List[LogEvent]:
         cmd = (

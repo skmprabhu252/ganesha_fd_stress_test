@@ -43,6 +43,11 @@ class ServerConfig:
     ganesha_log_path: str = "/var/log/ganesha.log"
     node_id: str = ""                    # optional Ganesha node ID
     ganesha_stats_cmd: str = "ganesha_stats inode"
+    # D-Bus command for FD usage statistics (preferred method for accurate FD breakdown)
+    # This provides more accurate FD statistics during burst I/O compared to ganesha.log parsing
+    dbus_fd_stats_cmd: str = "dbus-send --system --print-reply --dest=org.ganesha.nfsd /org/ganesha/nfsd/ExportMgr org.ganesha.nfsd.exportstats.ShowFDUsage"
+    # Use dbus for FD stats instead of ganesha_stats (recommended for burst/cooldown monitoring)
+    use_dbus_fd_stats: bool = True
     # Physical node address used for SSH management access.
     # When running from an OpenStack orchestrator node the Ganesha server is
     # reached by its real IP/hostname for SSH while the VIP (address) is only

@@ -80,7 +80,7 @@ from nfs_ganesha_fd_lru_test.framework.config import (
     make_default_test_config,
 )
 from nfs_ganesha_fd_lru_test.framework.fd_stats import (
-    BaselineStats, FDSample, parse_ganesha_stats,
+    BaselineStats, FDSample, parse_ganesha_stats, parse_dbus_fd_usage,
 )
 from nfs_ganesha_fd_lru_test.framework.log_parser import (
     LogEvent, LogEventKind,
@@ -514,6 +514,139 @@ Temporary FDs          : 2288
 
     def test_gpfs_lru_entries(self):
         self.assertEqual(parse_ganesha_stats(self.GPFS_SAMPLE).lru_entries_in_use, 83254)
+
+
+class TestDBusFDStatsParser(unittest.TestCase):
+    """Test parse_dbus_fd_usage() with actual dbus-send output format."""
+
+    DBUS_SAMPLE = """\
+method return time=1788647786.969864 sender=:1.1007353 -> destination=:1.1032548 serial=26575 reply_serial=2
+   boolean true
+   string "OK"
+   struct {
+      uint64 1788647786
+      uint64 969291083
+   }
+   struct {
+      string "System limit on FDs"
+      uint32 20000
+      string "FD Low WaterMark"
+      uint32 0
+      string "FD High WaterMark"
+      uint32 12000
+      string "FD Hard Limt"
+      uint32 18000
+      string "FD usage"
+      string "        Below High Water Mark "
+      string "FSAL opened Global FD count"
+      uint32 1774
+      string "FSAL opened State FD count"
+      uint32 0
+      string "NFSv4 open state count"
+      uint64 0
+   }
+"""
+
+    def test_system_fd_limit(self):
+        """System FD limit is extracted correctly."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertEqual(s.system_fd_limit, 20000)
+
+    def test_global_fd(self):
+        """Global FD count is extracted correctly."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertEqual(s.global_fd, 1774)
+
+    def test_state_fd(self):
+        """State FD count is extracted correctly."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertEqual(s.state_fd, 0)
+
+    def test_fsal_opened_fd_computed(self):
+        """Total FSAL opened FD is computed as global + state."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertEqual(s.fsal_opened_fd, 1774)  # 1774 + 0
+
+    def test_total_fd_equals_fsal_opened(self):
+        """total_fd is set to fsal_opened_fd."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertEqual(s.total_fd, s.fsal_opened_fd)
+
+    def test_fd_usage_label_captured(self):
+        """FD usage text label is captured."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertEqual(s.fd_usage_label, "Below High Water Mark")
+
+    def test_fd_usage_pct_computed(self):
+        """FD usage percentage is computed from fsal_opened_fd / system_fd_limit."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        expected = (1774 / 20000) * 100.0
+        self.assertAlmostEqual(s.fd_usage_pct, expected, places=2)
+
+    def test_is_valid(self):
+        """Sample with valid data passes is_valid check."""
+        s = parse_dbus_fd_usage(self.DBUS_SAMPLE)
+        self.assertTrue(s.is_valid)
+
+    def test_with_state_fds(self):
+        """Handles non-zero state FDs correctly."""
+        sample_with_state = self.DBUS_SAMPLE.replace(
+            'string "FSAL opened State FD count"\n      uint32 0',
+            'string "FSAL opened State FD count"\n      uint32 500'
+        )
+        s = parse_dbus_fd_usage(sample_with_state)
+        self.assertEqual(s.state_fd, 500)
+        self.assertEqual(s.fsal_opened_fd, 1774 + 500)  # global + state
+
+    def test_nfsv4_open_state_count_fallback(self):
+        """NFSv4 open state count is used when State FD count is 0."""
+        sample_with_v4_state = self.DBUS_SAMPLE.replace(
+            'string "NFSv4 open state count"\n      uint64 0',
+            'string "NFSv4 open state count"\n      uint64 250'
+        )
+        s = parse_dbus_fd_usage(sample_with_v4_state)
+        # state_fd should be 250 (from NFSv4 open state count fallback)
+        self.assertEqual(s.state_fd, 250)
+
+    def test_empty_output_defaults(self):
+        """Empty output produces default values."""
+        s = parse_dbus_fd_usage("")
+        self.assertEqual(s.fsal_opened_fd, 0)
+        self.assertEqual(s.system_fd_limit, 0)
+        self.assertEqual(s.global_fd, 0)
+        self.assertEqual(s.state_fd, 0)
+
+    def test_partial_output_no_raise(self):
+        """Partial dbus output doesn't raise exceptions."""
+        partial = """\
+   struct {
+      string "System limit on FDs"
+      uint32 10000
+      string "FSAL opened Global FD count"
+      uint32 5000
+   }
+"""
+        s = parse_dbus_fd_usage(partial)
+        self.assertEqual(s.system_fd_limit, 10000)
+        self.assertEqual(s.global_fd, 5000)
+
+    def test_high_watermark_label(self):
+        """Above High Water Mark label is captured."""
+        sample_above_hwm = self.DBUS_SAMPLE.replace(
+            'string "        Below High Water Mark "',
+            'string "        Above High Water Mark "'
+        )
+        s = parse_dbus_fd_usage(sample_above_hwm)
+        self.assertEqual(s.fd_usage_label, "Above High Water Mark")
+
+    def test_hard_limit_label(self):
+        """Hard Limit reached label is captured."""
+        sample_hard_limit = self.DBUS_SAMPLE.replace(
+            'string "        Below High Water Mark "',
+            'string "        Hard Limit reached "'
+        )
+        s = parse_dbus_fd_usage(sample_hard_limit)
+        self.assertEqual(s.fd_usage_label, "Hard Limit reached")
 
 
 # =============================================================================

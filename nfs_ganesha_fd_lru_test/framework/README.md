@@ -45,7 +45,29 @@ testing with localhost-style addresses.
 
 ### `fd_stats.py`
 
-Parses `ganesha_stats inode` output into structured `FDSample` objects.
+Parses FD statistics from either `ganesha_stats inode` or `dbus-send ShowFDUsage`
+into structured `FDSample` objects.
+
+**FD Statistics Collection Methods**
+
+The framework supports two methods for collecting FD statistics:
+
+1. **dbus-send ShowFDUsage** (Recommended) — Uses D-Bus to query Ganesha's
+   `ShowFDUsage` method. This provides accurate FD breakdown during burst I/O
+   and is the preferred method for monitoring FD details during burst and
+   cooldown phases.
+   
+   Command:
+   ```bash
+   dbus-send --system --print-reply --dest=org.ganesha.nfsd \
+     /org/ganesha/nfsd/ExportMgr \
+     org.ganesha.nfsd.exportstats.ShowFDUsage
+   ```
+
+2. **ganesha_stats inode** (Fallback) — Parses the output of `ganesha_stats inode`.
+   May not fetch proper values during burst I/O conditions.
+
+The method is controlled by `ServerConfig.use_dbus_fd_stats` (default: `True`).
 
 **`FDSample` fields**
 
@@ -129,8 +151,8 @@ restart counts.
 
 ### `monitor.py`
 
-Background thread that polls `ganesha_stats` and tails the Ganesha log during
-burst and cooldown phases.
+Background thread that polls FD statistics (via dbus-send or ganesha_stats) and
+tails the Ganesha log during burst and cooldown phases.
 
 **`ServerMonitor`**
 
@@ -140,6 +162,7 @@ burst and cooldown phases.
 | `start_phase(label)` | Starts a daemon polling thread and returns a new `MonitorPhase`. |
 | `stop_phase(phase)` | Signals the thread to stop, joins it (30 s timeout), records `end_time`. |
 | `collect_baseline(num_samples, interval_sec)` | Collects FD snapshots before the workload starts. Returns a `MonitorPhase` labelled `"baseline"`. |
+| `_poll_stats()` | Polls FD statistics using dbus-send (when `use_dbus_fd_stats=True`) or ganesha_stats (fallback). The dbus method provides accurate FD breakdown during burst I/O. |
 
 **`MonitorPhase` derived properties**
 
