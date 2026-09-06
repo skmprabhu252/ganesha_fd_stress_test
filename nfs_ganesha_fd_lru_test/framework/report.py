@@ -124,16 +124,36 @@ class ReportBuilder:
     ) -> None:
         self._section("4. FD/LRU TIME SERIES")
         # Column key:
-        #   Total FD  = FSAL opened FD count (= Global + State + Temp when breakdown available)
-        #   Global FD = reclaimable FDs managed by the LRU (NFSv3 + reclaimable NFSv4)
-        #   State FD  = NFSv4 open-state FDs (client-closed, not LRU-managed)
-        #   Temp FD   = short-lived FDs quickly reclaimed by the LRU
-        #   LRU cache = inode-cache entries (superset; includes entries whose FDs were reclaimed)
+        #   Total FD  = authoritative open FD count.
+        #               When dbus is used: global_fd + state_fd (temp not reported by dbus).
+        #               When ganesha_stats with Patch-1247084: global_fd + state_fd + temp_fd.
+        #               Falls back to fsal_opened_fd when no per-category breakdown exists.
+        #   Global FD = reclaimable FDs managed by the LRU (NFSv3 + reclaimable NFSv4).
+        #               Populated by dbus (FSAL opened Global FD count) and Patch-1247084 builds.
+        #   State FD  = NFSv4 open-state FDs (client-closed, not LRU-managed).
+        #               Populated by dbus (FSAL opened State FD count) and Patch-1247084 builds.
+        #   Temp FD   = short-lived FDs quickly reclaimed by the LRU.
+        #               Only available from Patch-1247084 ganesha_stats builds; 0 when using dbus.
+        #   LRU cache = inode-cache entries (superset; includes entries whose FDs were reclaimed).
         for phase in phases:
             self._ln(f"\n  Phase: {phase.label.upper()}")
             if not phase.samples:
                 self._ln("    (no samples)")
                 continue
+            # Detect whether this phase has any per-category breakdown so we can
+            # annotate columns that are not available for this build/source.
+            has_global = any(s.global_fd > 0 for s in phase.samples)
+            has_state  = any(s.state_fd  > 0 for s in phase.samples)
+            has_temp   = any(s.temp_fd   > 0 for s in phase.samples)
+            if not (has_global or has_state or has_temp):
+                self._ln(
+                    "    Note: Global/State/Temp breakdown unavailable "
+                    "(ganesha_stats build without Patch-1247084; enable dbus for full breakdown)"
+                )
+            elif not has_temp:
+                self._ln(
+                    "    Note: Temp FD not reported by dbus source (shown as 0)"
+                )
             self._ln(
                 f"  {'Time':>8} {'Total FD':>12} {'Global':>10} {'State':>10} "
                 f"{'Temp':>10} {'Usage%':>8} {'LRU cache':>10}"
@@ -142,7 +162,7 @@ class ReportBuilder:
             for s in phase.samples:
                 ts = time.strftime("%H:%M:%S", time.localtime(s.timestamp))
                 self._ln(
-                    f"  {ts:>8} {s.fsal_opened_fd:>12,} {s.global_fd:>10,} "
+                    f"  {ts:>8} {s.effective_total_fd:>12,} {s.global_fd:>10,} "
                     f"{s.state_fd:>10,} {s.temp_fd:>10,} "
                     f"{s.fd_usage_pct:>8.1f} {s.lru_entries_in_use:>10,}"
                 )

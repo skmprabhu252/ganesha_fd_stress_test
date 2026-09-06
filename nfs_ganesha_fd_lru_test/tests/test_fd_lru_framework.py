@@ -1450,6 +1450,83 @@ class TestReportBuilder(unittest.TestCase):
         # Count occurrences of the raw event line in the report
         self.assertEqual(report_text.count("DUPLICATE EVENT LINE"), 1)
 
+    # ------------------------------------------------------------------
+    # Time-series rendering with dbus-sourced FD breakdown
+    # ------------------------------------------------------------------
+
+    def _build_with_samples(self, samples):
+        """Build a report with an explicit list of FDSample objects in one phase."""
+        cfg = _cfg()
+        env = EnvironmentInfo(server_address="ts", protocol="BOTH", fd_system_limit=20000)
+        b   = ReportBuilder(config=cfg, env=env, baseline=BaselineStats())
+        ph  = MonitorPhase(label="burst_cycle_1")
+        ph.samples = list(samples)
+        return b.build(SuiteVerdict(protocol="BOTH"), [ph], [])
+
+    def test_time_series_dbus_global_state_shown(self):
+        """When dbus populates global_fd/state_fd, the time series shows non-zero values."""
+        s = FDSample(
+            fsal_opened_fd=1774, total_fd=1774,
+            global_fd=1774, state_fd=0,
+            system_fd_limit=20000, fd_usage_pct=8.87,
+            lru_entries_in_use=1800,
+        )
+        text = self._build_with_samples([s])
+        # Global column must carry the dbus value, not zero
+        self.assertIn("1,774", text)
+
+    def test_time_series_dbus_note_shown_for_missing_temp(self):
+        """When dbus is the source (global/state populated, temp=0), a note is printed."""
+        s = FDSample(
+            fsal_opened_fd=1774, total_fd=1774,
+            global_fd=1774, state_fd=0, temp_fd=0,
+            system_fd_limit=20000, fd_usage_pct=8.87,
+        )
+        text = self._build_with_samples([s])
+        self.assertIn("Temp FD not reported by dbus source", text)
+
+    def test_time_series_no_breakdown_note_shown(self):
+        """When all three breakdown fields are 0, the 'enable dbus' note is printed."""
+        s = FDSample(
+            fsal_opened_fd=17950, total_fd=17950,
+            global_fd=0, state_fd=0, temp_fd=0,
+            system_fd_limit=20000, fd_usage_pct=89.8,
+        )
+        text = self._build_with_samples([s])
+        self.assertIn("enable dbus for full breakdown", text)
+
+    def test_time_series_no_breakdown_note_absent_when_global_present(self):
+        """The 'enable dbus' note must NOT appear when global_fd is populated."""
+        s = FDSample(
+            fsal_opened_fd=1774, total_fd=1774,
+            global_fd=1774, state_fd=0, temp_fd=0,
+            system_fd_limit=20000, fd_usage_pct=8.87,
+        )
+        text = self._build_with_samples([s])
+        self.assertNotIn("enable dbus for full breakdown", text)
+
+    def test_time_series_total_uses_effective_total_fd(self):
+        """Total FD column uses effective_total_fd (total_fd field when set)."""
+        s = FDSample(
+            fsal_opened_fd=1774, total_fd=1774,
+            global_fd=1274, state_fd=500, temp_fd=0,
+            system_fd_limit=20000, fd_usage_pct=8.87,
+        )
+        text = self._build_with_samples([s])
+        # effective_total_fd == total_fd == 1774
+        self.assertIn("1,774", text)
+
+    def test_time_series_no_dbus_note_when_temp_present(self):
+        """When temp_fd is populated (Patch-1247084 build), neither note is shown."""
+        s = FDSample(
+            fsal_opened_fd=524288, total_fd=524288,
+            global_fd=504000, state_fd=18000, temp_fd=2288,
+            system_fd_limit=1048576, fd_usage_pct=50.0,
+        )
+        text = self._build_with_samples([s])
+        self.assertNotIn("Temp FD not reported by dbus source", text)
+        self.assertNotIn("enable dbus for full breakdown", text)
+
 
 # =============================================================================
 # §6  Preflight (mock-based)
